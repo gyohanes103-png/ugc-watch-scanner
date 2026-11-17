@@ -530,7 +530,7 @@ def apply_ai(res, ai, cfg):
 def send(cfg, payload, url=None):
     url = url or cfg['discord_webhook_url']
     if not url:
-        log('  (no webhook set) ', payload['embeds'][0]['title'])
+        log('  (no webhook set) ', payload['embeds'][0].get('title') or payload['embeds'][0].get('author', {}).get('name', ''))
         return True
     for _ in range(5):
         r = requests.post(url, json=payload, timeout=20)
@@ -1253,14 +1253,15 @@ def cycle(db, cfg):
     TIERS.clear()
     started = time.time()
     LIVE.update(ctx=None, last=0, busy=False)
+    seg = started
     try:
         _cycle(db, cfg)
-        live_until_end()
+        seg = live_until_end(started)
     finally:
         merge_limits(db, LIMIT.export())
         flush_alerts(cfg)
         write_report(db)
-        report(db, cfg, started)
+        report(db, cfg, seg)
         digest(db, cfg)
         post_activity(cfg)
 ACTIVITY = []
@@ -1336,10 +1337,6 @@ def report(db, cfg, started):
     if cfg['status_updates'] == 'off' or (cfg['status_updates'] == 'alerts_only' and (not a)):
         return
     now = time.time()
-    starts = (kv_get(db, 'starts', []) + [int(started)])[-7:]
-    kv_set(db, 'starts', starts)
-    gaps = sorted((y - x for x, y in zip(starts, starts[1:]) if y - x >= 20 * 60))
-    nxt = int(started) + min(gaps[len(gaps) // 2] if gaps else 1800, 6 * 3600)
     n_mine = db.execute('select count(*) from mine').fetchone()[0]
     found = PENDING.get('found', [])
     if found:
@@ -1348,40 +1345,46 @@ def report(db, cfg, started):
             desc.append(f'...and {len(found) - 20} more in the alerts above')
     else:
         desc = ['Nothing new looks like your items.']
-    near = db.execute("select id,name,visual,creator from checked where at>=? and verdict='' and visual>=0.43 and (ai like 'similar%' or ai like 'remake%' or ai like 'same%' or (ai='' and visual>=0.6)) order by visual desc limit 5", (started,)).fetchall()
+    mins = max(1, round((now - started) / 60))
+    desc.append(f"\n-# Last {mins} min · next summary <t:{int(now + cfg.get('summary_minutes', 30) * 60)}:R>")
     fields = []
     add = lambda n, v, inline=True: fields.append({'name': n, 'value': v, 'inline': inline})
-    add('Live feed', f"**{STATS.get('live', 0)}** new uploads posted" + (f"\nRoblox said busy {STATS['limited']} times" if STATS.get('limited') else ''))
-    add('Full checks', f"**{STATS['checked']}** items vs your **{n_mine}**\n**{STATS['mesh']}** 3D models compared")
+    add('Live feed', f"**{STATS.get('live', 0):,}** new uploads")
+    add('Full checks', f"**{STATS['checked']:,}** items\n**{STATS['mesh']:,}** 3D models")
     sc = kv_get(db, 'scan_stats', {})
     queued = db.execute('select count(*) from deep').fetchone()[0] if db.execute("select 1 from sqlite_master where name='deep'").fetchone() else 0
     if sc.get('files'):
-        add('Catalog scan', (f"**{sc['compared']:,}** compared by picture\n" if sc.get('compared') else '') + (f"**{sc['models']:,}** compared by 3D model\n" if sc.get('models') else '') + f"**{sc['handed']:,}** sent for full checks" + (f', **{queued}** waiting' if queued else '') + f"\n{sc['files']}/{sc.get('total', 10)} machines · <t:{int(sc['at'])}:R>")
-    cal, L = (kv_get(db, 'calib', {}), kv_get(db, 'learn', {}))
-    learn = [f"Copy line **{cfg['copy_threshold']:.0%}** · 3D **{cfg.get('vox_copy', 0.8):.0%}**"]
-    if cal.get('same_n'):
-        learn.append(f"From {cal['same_n']} recolour pairs, {cal.get('diff_n', 0)} different-model pairs" + (f", {cal['aug_n']} changed pictures" if cal.get('aug_n') else '') + (f", {cal['aug3_n']} changed 3D models" if cal.get('aug3_n') else '') + (f", {cal['augt_n']} changed textures" if cal.get('augt_n') else ''))
-    if L.get('checked'):
-        learn.append(f"{L['checked']:,} past checks · {L.get('confirmed', 0)} copies/remakes confirmed")
-    add('Learned', '\n'.join(learn))
-    rl = kv_get(db, 'rate_limits', {})
-    names = {'catalog.roblox.com': 'Catalog search', 'catalog-details': 'Item details', 'assetdelivery': '3D files', 'thumbnails.roblox.com': 'Pictures'}
-    if rl:
-        add('Roblox limits learned', '\n'.join((f"{names.get(h, h)}: ~{v['budget']:.0f}/min, busy lasts {v['cool']:.1f} s" for h, v in rl.items() if h in names)) or 'nothing hit yet')
-    sp = kv_get(db, 'ai_spend', {})
-    ai = f"${sp.get(time.strftime('%Y-%m-%d'), 0):.2f} today" if sp.get('total') else 'not used yet'
+        add('Catalog scan', f"**{sc.get('compared', 0):,}** compared" + (f"\n**{sc['models']:,}** 3D models" if sc.get('models') else '') + f"\n**{sc['handed']:,}** look-alikes")
     waiting = db.execute('select count(*) from later').fetchone()[0]
-    add('Claude review', ai + (f'\n**{waiting}** waiting' if waiting else '') + (f"\n{STATS['note']}" if STATS['note'] else ''))
-    user = roblox_user(cfg)
-    add('Roblox sign-in', 'off (no cookie)' if user is None else f'**{user}**' if user else '**FAILED**: cookie expired')
-    add('This run', f'{max(1, round((now - started) / 60))} min · next <t:{nxt}:R>')
+    sp = kv_get(db, 'ai_spend', {})
+    add('Claude review', f"${sp.get(time.strftime('%Y-%m-%d'), 0):.2f} today" + (f"\n{STATS['note']}" if STATS['note'] else ''))
+    add('Waiting', f'**{queued + waiting:,}** for a full check')
+    if sc.get('files'):
+        add('Last scan', f"<t:{int(sc['at'])}:R>\n{sc['files']}/{sc.get('total', 16)} machines")
+    near = db.execute("select id,name,visual,creator from checked where at>=? and verdict='' and visual>=0.43 and (ai like 'similar%' or ai like 'remake%' or ai like 'same%' or (ai='' and visual>=0.6)) order by visual desc limit 5", (started,)).fetchall()
     if near:
         add('Closest not flagged', '\n'.join((f'`{pct(r[2]):>4.0%}` [{r[1][:45]}](https://www.roblox.com/catalog/{r[0]}) · {r[3][:20]}' for r in near)), False)
     repo = os.environ.get('DATA_REPO') or os.environ.get('GITHUB_REPOSITORY')
-    if repo:
-        desc.append(f'\n[Full report](https://github.com/{repo}/blob/main/REPORT.md)')
     title = f"{a} possible cop{('ies' if a != 1 else 'y')} found" if a else 'All clear'
-    send(cfg, {'username': 'UGC Watch', 'embeds': [{'author': {'name': 'UGC Watch · run summary'}, 'title': title, 'color': 15105570 if a else 3066993, 'description': '\n'.join(desc), 'fields': fields, 'footer': {'text': 'Checked'}, 'timestamp': stamp()}]})
+    main = {'author': {'name': 'UGC Watch · summary'}, 'title': title, 'color': 15105570 if a else 3066993, 'description': '\n'.join(desc), 'fields': fields, 'footer': {'text': 'Checked'}, 'timestamp': stamp()}
+    if repo:
+        main['url'] = f'https://github.com/{repo}/blob/main/REPORT.md'
+    send(cfg, {'username': 'UGC Watch', 'embeds': [main]})
+    time.sleep(1.0)
+    cal, L, rl = (kv_get(db, 'calib', {}), kv_get(db, 'learn', {}), kv_get(db, 'rate_limits', {}))
+    lines = [f"**Copy lines** · picture **{cfg['copy_threshold']:.0%}** · 3D shape **{cfg.get('vox_copy', 0.8):.0%}** · texture **{cfg.get('tex_copy', 0.95):.0%}**"]
+    if cal.get('same_n'):
+        parts = [f"{cal['same_n']:,} recolour pairs", f"{cal.get('diff_n', 0):,} different-model pairs"]
+        parts += [f'{cal[k]:,} {t}' for k, t in (('aug_n', 'changed pictures'), ('aug3_n', 'changed 3D models'), ('augt_n', 'changed textures')) if cal.get(k)]
+        lines.append('**From your items** · ' + ', '.join(parts))
+    if L.get('checked'):
+        lines.append(f"**From past checks** · {L['checked']:,} checked, {L.get('confirmed', 0)} copies or remakes confirmed")
+    names = {'catalog.roblox.com': 'catalog search', 'catalog-details': 'item details', 'assetdelivery': '3D files', 'thumbnails.roblox.com': 'pictures'}
+    lim = [f"{names[h]} ~{v['budget']:.0f}/min, busy lasts {v['cool']:.1f} s" for h, v in rl.items() if h in names and v.get('busy')]
+    lines.append('**Roblox limits** · ' + ('; '.join(lim) if lim else 'not hit yet'))
+    user = roblox_user(cfg)
+    lines.append('**Roblox sign-in** · ' + ('off (no cookie)' if user is None else user if user else 'FAILED, the cookie has expired'))
+    send(cfg, {'username': 'UGC Watch', 'embeds': [{'author': {'name': 'UGC Watch · what it has learned'}, 'color': 5793266, 'description': '\n'.join(lines)}]})
 
 def digest(db, cfg):
     last = kv_get(db, 'digest_at', 0)
@@ -1795,7 +1798,7 @@ def _cycle(db, cfg):
             db.commit()
             log(f'looked again at {len(ids)} items that were waiting for an AI review')
     ingest_scans(db)
-    check_deep(db, cfg, mine, types)
+    check_deep(db, cfg, mine, types, chunk=cfg.get('deep_chunk', 25))
 
 def live_poll(catch_up=False):
     if LIVE['busy'] or not LIVE.get('ctx'):
@@ -1923,8 +1926,8 @@ def merge_limits(db, new):
         old[h] = v if not o else {'budget': round((o['budget'] + v['budget']) / 2, 1), 'cool': round((o['cool'] + v['cool']) / 2, 2), 'busy': v.get('busy', 0)}
     kv_set(db, 'rate_limits', old)
 
-def check_deep(db, cfg, mine, types):
-    rows = db.execute('select id, raw from deep order by score desc').fetchall()
+def check_deep(db, cfg, mine, types, chunk=None):
+    rows = db.execute('select id, raw from deep order by score desc' + (f' limit {int(chunk)}' if chunk else '')).fetchall()
     if not rows:
         return
     ids = [r[0] for r in rows]
@@ -1935,7 +1938,8 @@ def check_deep(db, cfg, mine, types):
     for i, raw in back:
         db.execute('insert or ignore into deep values(?,?,?)', (i, json.loads(raw).get('_score', 0), raw))
     db.commit()
-    log(f"catalog scanner: checked {len(rows) - len(back)} look-alikes, {db.execute('select count(*) from deep').fetchone()[0]} still queued")
+    if not chunk:
+        log(f"catalog scanner: checked {len(rows) - len(back)} look-alikes, {db.execute('select count(*) from deep').fetchone()[0]} still queued")
 
 def pull_scans():
     import subprocess
@@ -1952,19 +1956,67 @@ def pull_scans():
         log('scan pull failed:', repr(e)[:120])
         return False
 
-def live_until_end():
+def live_until_end(started):
     if not LIVE.get('ctx'):
-        return
+        return started
     db, cfg, mine, types = LIVE['ctx']
-    pulled = time.time()
-    while time.time() < HARD['t'] - 75:
+    pulled, seg = (time.time(), started)
+    while time.time() < HARD['t'] - 120:
         live_poll()
         if time.time() - pulled > cfg.get('scan_pull_seconds', 240):
             pulled = time.time()
             if pull_scans():
                 ingest_scans(db)
-                check_deep(db, cfg, mine, types)
-        time.sleep(max(1.0, cfg.get('live_poll_seconds', 15) - (time.time() - LIVE['last'])))
+        check_deep(db, cfg, mine, types, chunk=cfg.get('deep_chunk', 25))
+        if time.time() - seg > cfg.get('summary_minutes', 30) * 60:
+            seg = checkpoint(db, cfg, mine, seg)
+        time.sleep(max(0.5, cfg.get('live_poll_seconds', 15) - (time.time() - LIVE['last'])))
+    return seg
+
+def checkpoint(db, cfg, mine, seg):
+    merge_limits(db, LIMIT.export())
+    calibrate(db, cfg, mine)
+    write_report(db)
+    report(db, cfg, seg)
+    digest(db, cfg)
+    db.commit()
+    save_data()
+    for k in STATS:
+        STATS[k] = '' if k == 'note' else 0
+    PENDING.clear()
+    TIERS.clear()
+    return time.time()
+
+def save_data():
+    import subprocess
+    if not (HERE / '.git').exists():
+        return False
+    g = lambda *a, **k: subprocess.run(['git', '-C', str(HERE)] + list(a), capture_output=True, text=True, timeout=120, **k)
+    g('config', 'user.name', 'bot')
+    g('config', 'user.email', 'bot@users.noreply.github.com')
+    done = [x for x in ((HERE / 'ingested.txt').read_text().split() if (HERE / 'ingested.txt').exists() else [])]
+    for attempt in range(4):
+        g('fetch', '-q', 'origin', 'main')
+        g('reset', '-q', 'origin/main')
+        g('add', *[f.name for f in HERE.iterdir() if f.suffix in ('.db', '.md')])
+        if done:
+            g('rm', '-q', '--cached', '--ignore-unmatch', *done)
+        if g('diff', '--cached', '--quiet').returncode == 0:
+            break
+        g('commit', '-q', '-m', 'update')
+        if g('push', '-q', 'origin', 'HEAD:main').returncode == 0:
+            break
+        time.sleep(5)
+    else:
+        log('save to the private repo failed, the final save will try again')
+        return False
+    for x in done:
+        try:
+            (HERE / x).unlink()
+        except OSError:
+            pass
+    (HERE / 'ingested.txt').write_text('')
+    return True
 LIVE = {'ctx': None, 'last': 0, 'busy': False}
 
 def main():
