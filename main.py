@@ -26,26 +26,103 @@ def log(*a):
         return
     print(time.strftime('%H:%M:%S'), *a, flush=True)
 
+class Limiter:
+    import threading as _th
+
+    def __init__(self):
+        self.st, self.lock = ({}, self._th.Lock())
+
+    def _s(self, host):
+        return self.st.setdefault(host, {'budget': 60.0, 'cool': 5.0, 'lo': 0.0, 'hi': 0.0, 'times': [], 'oks': [], 'until': 0.0, 'streak': 0.0, 'waited': 0.0, 'quiet': time.time(), 'busy': 0})
+
+    def before(self, host, max_block=float('inf')):
+        with self.lock:
+            st, now = (self._s(host), time.time())
+            st['times'] = [t for t in st['times'] if now - t < 60]
+            wait = max(st['until'] - now, st['times'][0] + 60 - now if len(st['times']) >= st['budget'] else 0)
+            if wait > max_block:
+                return False
+            if not st['streak'] and now - st['quiet'] > 120:
+                st['budget'], st['quiet'] = (min(1200.0, st['budget'] * 1.15), now)
+        if wait > 0:
+            STATS['waited'] += wait
+            time.sleep(wait)
+        with self.lock:
+            self._s(host)['times'].append(time.time())
+        return True
+
+    def busy(self, host, retry_after=None):
+        with self.lock:
+            st, now = (self._s(host), time.time())
+            st['busy'] += 1
+            STATS['limited'] = STATS.get('limited', 0) + 1
+            st['times'] = st['times'][:-1]
+            if st['streak']:
+                st['lo'] = max(st['lo'], now - st['streak'])
+            else:
+                ok = len([t for t in st['oks'] if now - t < 60])
+                st['budget'] = max(3.0, ok * 0.95)
+            exact = None
+            try:
+                exact = float(retry_after) if retry_after else None
+            except ValueError:
+                pass
+            if exact is not None:
+                st['cool'] = st['hi'] = exact
+                wait = exact
+            elif st['hi'] and st['hi'] - st['lo'] > 0.2:
+                wait = (st['lo'] + st['hi']) / 2
+            elif st['hi']:
+                wait = st['hi']
+            else:
+                wait = max(st['cool'], st['lo'] * 1.6 or st['cool'])
+            start = st['streak'] or now
+            st['waited'], st['until'] = (wait, start + wait)
+            st['streak'], st['quiet'] = (start, now)
+
+    def ok(self, host):
+        with self.lock:
+            st = self._s(host)
+            st['oks'] = [t for t in st['oks'] if time.time() - t < 60] + [time.time()]
+            if st['streak']:
+                took = time.time() - st['streak']
+                st['hi'] = min(st['hi'] or took, took)
+                st['lo'] = min(st['lo'], st['hi'])
+                st['cool'] = st['hi']
+                st['streak'] = 0.0
+
+    def export(self):
+        return {h: {'budget': round(v['budget'], 1), 'cool': round(v['cool'], 2), 'busy': v['busy']} for h, v in self.st.items()}
+
+    def load(self, saved):
+        for h, v in (saved or {}).items():
+            st = self._s(h)
+            st['budget'], st['cool'] = (float(v.get('budget', 60)), float(v.get('cool', 5)))
+            st['hi'] = st['cool'] if v.get('busy') else 0.0
+LIMIT = Limiter()
+
+def _host(url):
+    return url.split('/')[2] if '//' in url else url
+
 def http_json(url, params=None, tries=6, max_wait=90):
-    delay = 2.0
+    host = _host(url)
     for _ in range(tries):
+        if not LIMIT.before(host, max_wait):
+            return None
         try:
             r = sess.get(url, params=params, timeout=25)
         except requests.RequestException as e:
             log('  network error:', e)
-            time.sleep(delay)
-            delay = min(delay * 2, 60)
+            time.sleep(2)
             continue
         if r.status_code == 200:
+            LIMIT.ok(host)
             return r.json()
         if r.status_code == 429:
-            STATS['limited'] = STATS.get('limited', 0) + 1
-        if r.status_code in (429, 500, 502, 503, 504):
-            hdr = r.headers.get('Retry-After') or r.headers.get('x-ratelimit-reset') or ''
-            wait = min(float(hdr) + 0.5, max_wait) if hdr.replace('.', '', 1).isdigit() else min(delay, max_wait)
-            STATS['waited'] += wait
-            time.sleep(wait)
-            delay = min(delay * 2, 60)
+            LIMIT.busy(host, r.headers.get('Retry-After'))
+            continue
+        if r.status_code in (500, 502, 503, 504):
+            time.sleep(2)
             continue
         log(f'  HTTP {r.status_code} from {url}: {r.text[:120]}')
         return None
@@ -585,28 +662,26 @@ def details_batch(ids):
     out = []
     for k in range(0, len(ids), 100):
         body = {'items': [{'itemType': 'Asset', 'id': i} for i in ids[k:k + 100]]}
-        delay = 2.0
-        for _ in range(6):
+        for _ in range(8):
+            LIMIT.before('catalog-details')
             try:
                 r = sess.post(CATALOG.replace('/search/items/details', '/catalog/items/details'), json=body, headers={'x-csrf-token': CSRF['t']}, timeout=25)
             except requests.RequestException as e:
                 log('  network error:', e)
-                time.sleep(delay)
+                time.sleep(2)
                 continue
             if r.status_code == 403 and r.headers.get('x-csrf-token'):
                 CSRF['t'] = r.headers['x-csrf-token']
                 continue
             if r.status_code == 429:
-                STATS['waited'] += delay
-                time.sleep(delay)
-                delay = min(delay * 2, 60)
+                LIMIT.busy('catalog-details', r.headers.get('Retry-After'))
                 continue
             if r.status_code == 200:
+                LIMIT.ok('catalog-details')
                 out += r.json().get('data', [])
             else:
                 log(f'  HTTP {r.status_code} from item details: {r.text[:120]}')
             break
-        time.sleep(1.0)
     return out
 HARD = {'t': float('inf')}
 
@@ -621,7 +696,6 @@ def search_wide(url, pages, tries=6, max_wait=90, **params):
         if cursor:
             p['Cursor'] = cursor
         j = http_json(url, p, tries=tries, max_wait=max_wait)
-        time.sleep(1.2)
         if not j or not j.get('data'):
             return
         yield j['data']
@@ -642,15 +716,14 @@ def get_thumbs(ids):
         return (urls, dict(zip(ok, pool.map(fetch_feat, ok))))
 
 def asset_bytes(aid, cfg):
-    for k in range(4):
+    for k in range(8):
+        LIMIT.before('assetdelivery')
         r = sess.get(f'https://assetdelivery.roblox.com/v2/assetId/{aid}', headers={'Cookie': '.ROBLOSECURITY=' + cfg['roblox_cookie']}, timeout=25)
         if r.status_code != 429:
+            LIMIT.ok('assetdelivery')
             break
-        wait = float(r.headers.get('Retry-After') or 0) or 3 * (k + 1)
-        STATS['waited'] += wait
-        time.sleep(min(wait, 30))
+        LIMIT.busy('assetdelivery', r.headers.get('Retry-After'))
     loc = (r.json().get('locations') or [{}])[0].get('location') if r.text[:1] == '{' else None
-    time.sleep(0.4)
     if not loc:
         STATS['mesh_fail'] += 1
         if STATS['mesh_fail'] <= 3:
@@ -1184,6 +1257,7 @@ def cycle(db, cfg):
         _cycle(db, cfg)
         live_until_end()
     finally:
+        merge_limits(db, LIMIT.export())
         flush_alerts(cfg)
         write_report(db)
         report(db, cfg, started)
@@ -1290,6 +1364,10 @@ def report(db, cfg, started):
     if L.get('checked'):
         learn.append(f"{L['checked']:,} past checks · {L.get('confirmed', 0)} copies/remakes confirmed")
     add('Learned', '\n'.join(learn))
+    rl = kv_get(db, 'rate_limits', {})
+    names = {'catalog.roblox.com': 'Catalog search', 'catalog-details': 'Item details', 'assetdelivery': '3D files', 'thumbnails.roblox.com': 'Pictures'}
+    if rl:
+        add('Roblox limits learned', '\n'.join((f"{names.get(h, h)}: ~{v['budget']:.0f}/min, busy lasts {v['cool']:.1f} s" for h, v in rl.items() if h in names)) or 'nothing hit yet')
     sp = kv_get(db, 'ai_spend', {})
     ai = f"${sp.get(time.strftime('%Y-%m-%d'), 0):.2f} today" if sp.get('total') else 'not used yet'
     waiting = db.execute('select count(*) from later').fetchone()[0]
@@ -1536,6 +1614,7 @@ def scan_shard(db, cfg, shard, total, minutes=24):
     except sqlite3.OperationalError:
         offenders = []
     learned(db, cfg)
+    LIMIT.load(kv_get(db, 'rate_limits'))
     slices = scan_slices(mine, offenders)[shard::total]
     skip = set(cfg['ignore_creator_ids']) | {cfg['my_creator_id']}
     found, done = ({}, 0)
@@ -1575,7 +1654,7 @@ def scan_shard(db, cfg, shard, total, minutes=24):
     out = HERE / 'scan'
     out.mkdir(exist_ok=True)
     name = f"{os.environ.get('GITHUB_RUN_ID', int(time.time()))}-{shard}.json.gz"
-    stats = {'slices': done, 'of': len(slices), 'found': len(found), 'compared': scored, 'handed': len(keep), 'total': total, 'models': len(m3done), 'model_hits': len(m3hits)}
+    stats = {'slices': done, 'of': len(slices), 'found': len(found), 'compared': scored, 'handed': len(keep), 'total': total, 'models': len(m3done), 'model_hits': len(m3hits), 'limits': LIMIT.export()}
     (out / name).write_bytes(gzip.compress(json.dumps({'stats': stats, 'items': keep, 'm3': m3done}).encode()))
     log(f'compared {scored} items by picture, {len(m3done)} by 3D model, {len(keep)} look-alikes handed to the watcher')
 
@@ -1666,6 +1745,7 @@ def ingest_scans(db):
             db.execute('create table if not exists m3seen(id integer primary key)')
             if isinstance(blob, dict):
                 db.executemany('insert or ignore into m3seen values(?)', [(i,) for i in blob.get('m3') or []])
+                merge_limits(db, (blob.get('stats') or {}).get('limits'))
             for d in items:
                 if not is_seen(db, d['id']):
                     db.execute('insert or ignore into deep values(?,?,?)', (d['id'], d.get('_score', 0), json.dumps(d)))
@@ -1692,6 +1772,7 @@ def _cycle(db, cfg):
     cfg.update(ai_max_calls_per_day=10 ** 9, max_alerts_per_cycle=10 ** 9)
     budget = cfg['max_alerts_per_cycle']
     deadline = HARD['t']
+    LIMIT.load(kv_get(db, 'rate_limits'))
     LIVE.update(ctx=(db, cfg, mine, types), last=0, busy=False)
     live_poll(catch_up=True)
     if cfg.get('roblox_cookie') and (not kv_get(db, 'mymesh_full')):
@@ -1834,6 +1915,13 @@ def flush_feed(cfg):
     for k in range(0, len(cards), 10):
         send(cfg, {'username': 'UGC Watch', 'embeds': cards[k:k + 10]}, url)
         time.sleep(1.0)
+
+def merge_limits(db, new):
+    old = kv_get(db, 'rate_limits', {})
+    for h, v in (new or {}).items():
+        o = old.get(h)
+        old[h] = v if not o else {'budget': round((o['budget'] + v['budget']) / 2, 1), 'cool': round((o['cool'] + v['cool']) / 2, 2), 'busy': v.get('busy', 0)}
+    kv_set(db, 'rate_limits', old)
 
 def check_deep(db, cfg, mine, types):
     rows = db.execute('select id, raw from deep order by score desc').fetchall()
