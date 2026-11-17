@@ -13,7 +13,7 @@ DEFAULTS = {'discord_webhook_url': '', 'my_creator_id': 0, 'my_creator_type': 'G
 sess = requests.Session()
 sess.headers['User-Agent'] = 'Mozilla/5.0 (ugc-watch; personal IP monitoring)'
 AI_DOWN = set()
-STATS = {'checked': 0, 'alerts': 0, 'ai_ok': 0, 'ai_failed': 0, 'waited': 0.0, 'note': '', 'mesh': 0, 'mesh_fail': 0, 'live': 0}
+STATS = {'checked': 0, 'alerts': 0, 'ai_ok': 0, 'ai_failed': 0, 'waited': 0.0, 'note': '', 'mesh': 0, 'mesh_fail': 0, 'live': 0, 'limited': 0}
 QUIET = {'on': False}
 
 def log(*a):
@@ -26,7 +26,7 @@ def log(*a):
         return
     print(time.strftime('%H:%M:%S'), *a, flush=True)
 
-def http_json(url, params=None, tries=6):
+def http_json(url, params=None, tries=6, max_wait=90):
     delay = 2.0
     for _ in range(tries):
         try:
@@ -38,9 +38,11 @@ def http_json(url, params=None, tries=6):
             continue
         if r.status_code == 200:
             return r.json()
+        if r.status_code == 429:
+            STATS['limited'] = STATS.get('limited', 0) + 1
         if r.status_code in (429, 500, 502, 503, 504):
             hdr = r.headers.get('Retry-After') or r.headers.get('x-ratelimit-reset') or ''
-            wait = min(float(hdr) + 0.5, 90) if hdr.replace('.', '', 1).isdigit() else delay
+            wait = min(float(hdr) + 0.5, max_wait) if hdr.replace('.', '', 1).isdigit() else min(delay, max_wait)
             STATS['waited'] += wait
             time.sleep(wait)
             delay = min(delay * 2, 60)
@@ -608,7 +610,7 @@ def details_batch(ids):
     return out
 HARD = {'t': float('inf')}
 
-def search_wide(url, pages, **params):
+def search_wide(url, pages, tries=6, max_wait=90, **params):
     cursor = None
     for _ in range(pages):
         if time.time() > HARD['t']:
@@ -618,7 +620,7 @@ def search_wide(url, pages, **params):
         p = {'Limit': 120, **params}
         if cursor:
             p['Cursor'] = cursor
-        j = http_json(url, p)
+        j = http_json(url, p, tries=tries, max_wait=max_wait)
         time.sleep(1.2)
         if not j or not j.get('data'):
             return
@@ -1275,7 +1277,7 @@ def report(db, cfg, started):
     near = db.execute("select id,name,visual,creator from checked where at>=? and verdict='' and visual>=0.43 and (ai like 'similar%' or ai like 'remake%' or ai like 'same%' or (ai='' and visual>=0.6)) order by visual desc limit 5", (started,)).fetchall()
     fields = []
     add = lambda n, v, inline=True: fields.append({'name': n, 'value': v, 'inline': inline})
-    add('Live feed', f"**{STATS.get('live', 0)}** new uploads posted")
+    add('Live feed', f"**{STATS.get('live', 0)}** new uploads posted" + (f"\nRoblox said busy {STATS['limited']} times" if STATS.get('limited') else ''))
     add('Full checks', f"**{STATS['checked']}** items vs your **{n_mine}**\n**{STATS['mesh']}** 3D models compared")
     sc = kv_get(db, 'scan_stats', {})
     queued = db.execute('select count(*) from deep').fetchone()[0] if db.execute("select 1 from sqlite_master where name='deep'").fetchone() else 0
@@ -1732,9 +1734,14 @@ def live_poll(catch_up=False):
         got = posted = 0
         pages = cfg.get('feed_catch_up_pages', 60) if catch_up or first else cfg.get('feed_live_pages', 10)
         url = CATALOG.replace('/v1/', '/v2/')
-        recheck = [r[0] for r in db.execute('select id from feedwait where at<? order by at limit 300', (time.time() - cfg.get('feed_recheck_seconds', 240),))]
-        for params in ({'IncludeNotForSale': 'true'}, {'salesTypeFilter': 1}):
-            for page in search_wide(url, pages, Category=1, SortType=3, **params):
+        recheck = [r[0] for r in db.execute('select id from feedwait where at<? order by at limit 100', (time.time() - cfg.get('feed_recheck_seconds', 600),))]
+        lists = [{'IncludeNotForSale': 'true'}]
+        if catch_up or first or time.time() - LIVE.get('onsale_at', 0) > cfg.get('feed_onsale_seconds', 120):
+            lists.append({'salesTypeFilter': 1})
+            LIVE['onsale_at'] = time.time()
+        for params in lists:
+            quick = {} if catch_up or first else {'tries': 3, 'max_wait': 12}
+            for page in search_wide(url, pages, Category=1, SortType=3, **quick, **params):
                 page = [d for d in page if d.get('itemType') == 'Asset']
                 new = [d for d in page if not db.execute('select 1 from fed where id=?', (d['id'],)).fetchone() and (not db.execute('select 1 from feedwait where id=?', (d['id'],)).fetchone())]
                 if not new:
@@ -1755,7 +1762,7 @@ def live_poll(catch_up=False):
         db.commit()
         waited = STATS['waited'] - waited0
         if got or waited:
-            log(f'feed: {got} new listings, {posted} posted, waited {round(waited)} s for Roblox')
+            log(f"feed: {got} new listings, {posted} posted, waited {round(waited)} s for Roblox, {STATS.get('limited', 0)} busy replies so far")
     except Exception as e:
         log('live feed error:', repr(e)[:160])
     finally:
