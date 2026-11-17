@@ -579,6 +579,7 @@ def search_wide(url, pages, **params):
         if time.time() > HARD['t']:
             log('  time limit for this run reached, the rest continues next run')
             return
+        live_poll()
         p = {'Limit': 120, **params}
         if cursor:
             p['Cursor'] = cursor
@@ -981,6 +982,7 @@ def my_models(db, cfg, mine):
     for m in todo:
         if time.time() > HARD['t']:
             break
+        live_poll()
         d = mesh_desc(m['id'], cfg, previews=False)
         if d and d.get('mesh_id'):
             d.pop('render', None)
@@ -1008,6 +1010,8 @@ def decide(db, cfg, mine, cand, feat, raw_png, left, src='new'):
             vm['png'] = fetch_feat(vm['thumb'])[1] if vm['thumb'] else None
         res = apply_ai(res, ai_compare(cfg, db, vm['png'], raw_png, vm['name'], cand['name']), cfg)
     want3d = bool(res and cfg.get('roblox_cookie') and res['visual_match'] and (res['verdict'] or res['visual'] >= cfg['ai_min_visual'] or res['name'] >= 0.6 or (res['desc'] >= 0.3) or res['credit'] or (res['ai'] and res['ai']['relation'] != 'unrelated')))
+    if want3d and src != 'new':
+        live_poll()
     theirs = mesh_desc(cand['id'], cfg) if want3d and time.time() < HARD['t'] else None
     if theirs and theirs.get('mesh_id'):
         if MYM['list'] is None:
