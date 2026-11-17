@@ -1102,8 +1102,6 @@ def process(db, cfg, mine, raw, types, budget, src='new'):
         cand['thumb'] = u if ok else ''
         feat, raw_png = feats[u] if ok else (None, None)
         sent += decide(db, cfg, mine, cand, feat, raw_png, budget - sent, src) or 0
-        if src == 'new':
-            post_feed(cfg, force=False)
     return sent
 
 def cycle(db, cfg):
@@ -1171,31 +1169,7 @@ def mesh_cards(m, colour=5793266):
     return [theirs, yours]
 
 def post_activity(cfg):
-    post_feed(cfg)
-FEED_AT = {'t': 0.0}
-
-def post_feed(cfg, force=True):
-    url = cfg.get('feed_webhook_url')
-    fresh = [e for e in ACTIVITY if e[0] == 'new']
-    if not force and len(fresh) < 3 and (time.time() - FEED_AT['t'] < 8):
-        return
-    FEED_AT['t'] = time.time()
-    ACTIVITY[:] = [e for e in ACTIVITY if e[0] != 'new']
-    if not url or not fresh:
-        return
-    cut = time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(time.time() - cfg.get('feed_max_age_hours', 6) * 3600))
-    fresh = sorted((e for e in fresh if (e[1].get('created') or '')[:19] >= cut), key=lambda e: e[1].get('created') or '')
-    cards = []
-    for src, c, v, mname, hit in fresh:
-        link = f"https://www.roblox.com/catalog/{c['id']}"
-        card = {'author': {'name': 'UGC Watch'}, 'title': c['name'][:250], 'url': link, 'color': 15105570 if hit else 3108845, 'description': f"New UGC {KIND.get(c.get('atype'), 'Accessory')}\n[Roblox Page]({link})" + ('\n**Flagged, see the alerts channel**' if hit else ''), 'fields': [fld('Price', cost(c)), fld('Creator', who(c)), fld('Closest to yours', f'{pct(v):.0%} · {mname[:40]}' if mname else 'none'), fld('Uploaded', when(c.get('created') or ''))], 'footer': {'text': 'Checked'}, 'timestamp': stamp()}
-        if c.get('thumb'):
-            card['thumbnail'] = {'url': c['thumb']}
-        cards.append(card)
-    STATS['live'] += len(cards)
-    for k in range(0, len(cards), 10):
-        send(cfg, {'username': 'UGC Watch', 'embeds': cards[k:k + 10]}, url)
-        time.sleep(1.0)
+    ACTIVITY.clear()
 
 def write_report(db):
 
@@ -1476,28 +1450,79 @@ def live_poll(catch_up=False):
         return
     LIVE['busy'] = True
     try:
-        for sub in sorted({SUBCAT.get(t, 0) for t in types}):
-            params = {'Subcategory': sub} if sub else {}
-            got = stale = 0
-            pages = cfg.get('feed_wide_pages', 4) * (1 if sub else 4) if catch_up else 2
-            for page in search_wide(CATALOG.replace('/details', ''), pages, Category=11, SortType=3, salesTypeFilter=1, **params):
-                new = [d['id'] for d in page if d.get('itemType') == 'Asset' and (not is_seen(db, d['id']))]
-                got += len(new)
-                items = details_batch(new) if new else []
-                for i in set(new) - {d['id'] for d in items}:
-                    mark(db, i)
-                process(db, cfg, mine, items, types, cfg.get('max_alerts_per_cycle', 40))
-                stale = 0 if new else stale + 1
-                if stale >= (2 if catch_up else 1):
-                    break
-            if got:
-                log(f"feed {('subcategory %d' % sub if sub else 'all accessories')}: {got} new items")
-        post_feed(cfg)
+        db.execute('create table if not exists fed(id integer primary key, at real)')
+        first = not kv_get(db, 'feed_since')
+        if first:
+            kv_set(db, 'feed_since', time.time())
+        cut = time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(time.time() - cfg.get('feed_max_age_days', 3) * 86400))
+        got = posted = 0
+        pages = cfg.get('feed_catch_up_pages', 25) if catch_up or first else cfg.get('feed_live_pages', 8)
+        for page in search_wide(CATALOG.replace('/details', ''), pages, Category=1, SortType=3, salesTypeFilter=1):
+            new = [d['id'] for d in page if d.get('itemType') == 'Asset' and (not db.execute('select 1 from fed where id=?', (d['id'],)).fetchone())]
+            if not new:
+                break
+            got += len(new)
+            if first:
+                db.executemany('insert or ignore into fed values(?,?)', [(i, time.time()) for i in new])
+                continue
+            items = details_batch(new)
+            for i in set(new) - {d['id'] for d in items}:
+                db.execute('insert or ignore into fed values(?,?)', (i, time.time()))
+            show = []
+            for d in items:
+                limited = set(d.get('itemRestrictions') or []) & {'Collectible', 'Limited', 'LimitedUnique'}
+                if limited or d.get('creatorTargetId') == 1 or (d.get('itemCreatedUtc') or '')[:19] < cut:
+                    db.execute('insert or ignore into fed values(?,?)', (d['id'], time.time()))
+                else:
+                    show.append(d)
+            show.sort(key=lambda d: d.get('itemCreatedUtc') or '')
+            for k in range(0, len(show), 5):
+                chunk = show[k:k + 5]
+                process(db, cfg, mine, chunk, ACCESSORY | types, cfg.get('max_alerts_per_cycle', 40))
+                posted += feed_cards(db, cfg, chunk)
+            db.commit()
+        db.commit()
+        if got:
+            log(f'feed: {got} new listings, {posted} posted')
     except Exception as e:
         log('live feed error:', repr(e)[:160])
     finally:
         LIVE['busy'] = False
         LIVE['last'] = time.time()
+ASSET_KIND = {8: 'Hat', 41: 'Hair Accessory', 42: 'Face Accessory', 43: 'Neck Accessory', 44: 'Shoulder Accessory', 45: 'Front Accessory', 46: 'Back Accessory', 47: 'Waist Accessory', 61: 'Emote', 64: 'T-Shirt Accessory', 65: 'Shirt Accessory', 66: 'Pants Accessory', 67: 'Jacket Accessory', 68: 'Sweater Accessory', 69: 'Shorts Accessory', 70: 'Left Shoe Accessory', 71: 'Right Shoe Accessory', 72: 'Dress Skirt Accessory', 76: 'Eyebrow Accessory', 77: 'Eyelash Accessory', 78: 'Mood Animation', 79: 'Dynamic Head', 92: 'Avatar Background'}
+
+def feed_cards(db, cfg, items):
+    url = cfg.get('feed_webhook_url')
+    info = {e[1]['id']: e for e in ACTIVITY if e[0] == 'new'}
+    ACTIVITY[:] = [e for e in ACTIVITY if e[0] != 'new']
+    pics = thumb_urls([d['id'] for d in items])
+    cards = []
+    for d in items:
+        u = pics.get(d['id'])
+        if u in ('Pending', 'InReview', None) and d['id'] not in info:
+            continue
+        db.execute('insert or ignore into fed values(?,?)', (d['id'], time.time()))
+        c = to_cand(d)
+        link = f"https://www.roblox.com/catalog/{c['id']}"
+        e = info.get(c['id'])
+        hit = bool(e and e[4])
+        mine_item = c['cid'] == cfg['my_creator_id']
+        fields = [fld('Price', cost(c)), fld('Creator', who(c))]
+        if mine_item:
+            fields.append(fld('Closest to yours', 'your own item'))
+        elif e:
+            fields.append(fld('Closest to yours', f'{pct(e[2]):.0%} · {e[3][:40]}' if e[3] else 'none'))
+        fields.append(fld('Uploaded', when(c.get('created') or '')))
+        card = {'author': {'name': 'UGC Watch'}, 'title': c['name'][:250], 'url': link, 'color': 15105570 if hit else 3066993 if mine_item else 3108845, 'description': f"New UGC {ASSET_KIND.get(c.get('atype'), 'Item')}\n[Roblox Page]({link})" + ('\n**Flagged, see the alerts channel**' if hit else ''), 'fields': fields, 'footer': {'text': 'Found'}, 'timestamp': stamp()}
+        if isinstance(u, str) and u.startswith('http'):
+            card['thumbnail'] = {'url': u}
+        cards.append(card)
+    if url:
+        for k in range(0, len(cards), 10):
+            send(cfg, {'username': 'UGC Watch', 'embeds': cards[k:k + 10]}, url)
+            time.sleep(1.0)
+    STATS['live'] += len(cards)
+    return len(cards)
 
 def live_until_end():
     if not LIVE.get('ctx'):
