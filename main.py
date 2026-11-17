@@ -9,7 +9,7 @@ THUMBS = 'https://thumbnails.roblox.com/v1/assets'
 SUBCAT = {46: 25, 47: 26}
 COLOURS = set('black white grey gray red blue pink purple violet green yellow orange brown\nlight dark pastel neon gold golden silver cyan teal lavender beige cream blonde ginger\nombre rainbow and'.split())
 STOP = set('the a an of for with to in on my your our is it its this that very'.split())
-DEFAULTS = {'discord_webhook_url': '', 'my_creator_id': 0, 'my_creator_type': 'Group', 'ignore_creator_ids': [], 'extra_asset_types': [], 'poll_minutes': 5, 'feed_pages': 6, 'sweep_hours': 12, 'sweep_pages': 15, 'refresh_my_items_hours': 6, 'copy_threshold': 0.8, 'remake_threshold': 0.63, 'combo_threshold': 0.5, 'ai_provider': 'auto', 'anthropic_api_key': '', 'gemini_api_key': '', 'anthropic_workspace_id': '', 'anthropic_model': 'claude-haiku-5-5', 'gemini_model': 'gemini-3.5-flash', 'ai_min_visual': 0.45, 'ai_max_calls_per_day': 10 ** 9, 'text_alerts': True, 'max_alerts_per_cycle': 10 ** 9, 'status_updates': 'every_run', 'max_run_minutes': 12}
+DEFAULTS = {'discord_webhook_url': '', 'my_creator_id': 0, 'my_creator_type': 'Group', 'ignore_creator_ids': [], 'extra_asset_types': [], 'poll_minutes': 5, 'feed_pages': 6, 'sweep_hours': 12, 'sweep_pages': 15, 'refresh_my_items_hours': 6, 'copy_threshold': 0.8, 'remake_threshold': 0.63, 'combo_threshold': 0.5, 'ai_provider': 'auto', 'anthropic_api_key': '', 'gemini_api_key': '', 'anthropic_workspace_id': '', 'anthropic_model': 'claude-haiku-5-5', 'gemini_model': 'gemini-3.5-flash', 'ai_min_visual': 0.42, 'scan_min_visual': 0.42, 'ai_max_calls_per_day': 10 ** 9, 'text_alerts': True, 'max_alerts_per_cycle': 10 ** 9, 'status_updates': 'every_run', 'max_run_minutes': 12}
 sess = requests.Session()
 sess.headers['User-Agent'] = 'Mozilla/5.0 (ugc-watch; personal IP monitoring)'
 AI_DOWN = set()
@@ -877,6 +877,17 @@ def model_ids(data):
     return out
 AI_MESH = re.compile('tripo|meshy|rodin|hyper3d|luma|csm_|kaedim|sloyd|genie|hunyuan', re.I)
 
+def tex_feats(im):
+    out = {}
+    g = np.asarray(im.convert('L').resize((32, 32)), np.float32)
+    if g.std() >= 4:
+        out['texv'] = (g - g.mean()) / g.std()
+        c = np.asarray(im.convert('RGB').resize((64, 64)), np.float32)
+        e = sum((np.hypot(*np.gradient(c[..., k])) for k in range(3)))
+        if e.std() > 0:
+            out['texe'] = (e - e.mean()) / e.std()
+    return out
+
 def mesh_desc(asset_id, cfg, previews=True):
     try:
         data = asset_bytes(asset_id, cfg)
@@ -889,19 +900,18 @@ def mesh_desc(asset_id, cfg, previews=True):
                 v, nf = mesh_geom(mb)
                 if v is not None and len(v) >= 50 and np.isfinite(v).any():
                     out.update(n=len(v), nf=nf, hist=_d2(v[np.isfinite(v).all(1)]), vox=_vox(v))
+                    fv = v[np.isfinite(v).all(1)]
+                    pick = np.random.default_rng(0).choice(len(fv), min(2500, len(fv)), replace=False)
+                    out['pts'] = fv[np.sort(pick)].astype(np.float16)
                 else:
                     log(f"  mesh {ids['mesh']} of item {asset_id}: format {mb[:12]!r} not readable, comparing by id and file only")
             tb = asset_bytes(ids['tex'], cfg) if ids.get('tex') else None
             if tb:
                 out['tex_sha'] = hashlib.sha256(tb).hexdigest()
                 try:
-                    g = np.asarray(Image.open(io.BytesIO(tb)).convert('L').resize((32, 32)), np.float32)
-                    if g.std() >= 4:
-                        out['texv'] = (g - g.mean()) / g.std()
-                        g2 = np.asarray(Image.open(io.BytesIO(tb)).convert('L').resize((64, 64)), np.float32)
-                        e = np.hypot(*np.gradient(g2))
-                        if e.std() > 0:
-                            out['texe'] = (e - e.mean()) / e.std()
+                    im = Image.open(io.BytesIO(tb)).convert('RGB')
+                    out.update(tex_feats(im))
+                    out['tex_small'] = np.asarray(im.resize((64, 64)), np.uint8)
                 except Exception:
                     pass
             try:
@@ -1009,9 +1019,10 @@ def my_models(db, cfg, mine):
     import pickle
     db.execute('create table if not exists mymesh(id integer primary key, at real, blob blob)')
     have = {r[0]: r[1] for r in db.execute('select id, blob from mymesh')}
-    if not kv_get(db, 'mymesh_v3'):
+    if not kv_get(db, 'mymesh_v4'):
         db.execute('delete from mymesh')
-        kv_set(db, 'mymesh_v3', 1)
+        kv_set(db, 'mymesh_v4', 1)
+        kv_set(db, 'mymesh_full', 0)
         have = {}
     todo = [m for m in mine if m['id'] not in have]
     for m in todo:
@@ -1082,7 +1093,7 @@ def decide(db, cfg, mine, cand, feat, raw_png, left, src='new'):
                 level = ('Likely COPY / recolour of your model (3D model matches)', 15158332, 0.97)
             elif not res['verdict'] and g['same_tex']:
                 level = ('Possible REMAKE of your model (uses your texture)', 15105570, 0.8)
-            elif not res['verdict'] and (not ai_no) and ((g['texsim'] or 0) >= 0.95):
+            elif not res['verdict'] and (not ai_no) and ((g['texsim'] or 0) >= cfg.get('tex_copy', 0.95)):
                 level = ('Possible REMAKE of your model (uses your texture)', 15105570, 0.75)
             elif not res['verdict'] and (not ai_no) and g['inner'] and looks:
                 level = ('Possible REMAKE of your model (their file carries your internal name)', 15105570, 0.75)
@@ -1269,11 +1280,11 @@ def report(db, cfg, started):
     sc = kv_get(db, 'scan_stats', {})
     queued = db.execute('select count(*) from deep').fetchone()[0] if db.execute("select 1 from sqlite_master where name='deep'").fetchone() else 0
     if sc.get('files'):
-        add('Catalog scan', (f"**{sc['compared']:,}** compared by picture\n" if sc.get('compared') else '') + f"**{sc['handed']:,}** sent for full checks" + (f', **{queued}** waiting' if queued else '') + f"\n{sc['files']}/{sc.get('total', 10)} machines · <t:{int(sc['at'])}:R>")
+        add('Catalog scan', (f"**{sc['compared']:,}** compared by picture\n" if sc.get('compared') else '') + (f"**{sc['models']:,}** compared by 3D model\n" if sc.get('models') else '') + f"**{sc['handed']:,}** sent for full checks" + (f', **{queued}** waiting' if queued else '') + f"\n{sc['files']}/{sc.get('total', 10)} machines · <t:{int(sc['at'])}:R>")
     cal, L = (kv_get(db, 'calib', {}), kv_get(db, 'learn', {}))
     learn = [f"Copy line **{cfg['copy_threshold']:.0%}** · 3D **{cfg.get('vox_copy', 0.8):.0%}**"]
     if cal.get('same_n'):
-        learn.append(f"From {cal['same_n']} recolour pairs, {cal.get('diff_n', 0)} different-model pairs" + (f", {cal['aug_n']} turned/flipped/recoloured views" if cal.get('aug_n') else ''))
+        learn.append(f"From {cal['same_n']} recolour pairs, {cal.get('diff_n', 0)} different-model pairs" + (f", {cal['aug_n']} changed pictures" if cal.get('aug_n') else '') + (f", {cal['aug3_n']} changed 3D models" if cal.get('aug3_n') else '') + (f", {cal['augt_n']} changed textures" if cal.get('augt_n') else ''))
     if L.get('checked'):
         learn.append(f"{L['checked']:,} past checks · {L.get('confirmed', 0)} copies/remakes confirmed")
     add('Learned', '\n'.join(learn))
@@ -1327,6 +1338,8 @@ def calibrate(db, cfg, mine):
                     if ma.get('vox') is not None and mb.get('vox') is not None:
                         vdiff.append((ma['vox'], mb['vox']))
         aug = augment_scores(items)
+        aug3 = augment_models(items, meshes)
+        augt = augment_textures(items, meshes)
         if len(vdiff) > 250:
             vdiff = [vdiff[i] for i in rng.choice(len(vdiff), 250, replace=False)]
         strict = []
@@ -1343,11 +1356,24 @@ def calibrate(db, cfg, mine):
         if aug:
             allv = [v for vs in aug.values() for v in vs]
             cal.update(aug={k: float(np.median(v)) for k, v in aug.items()}, aug_lo=float(np.percentile(allv, 10)), aug_n=len(allv))
+        if aug3:
+            all3 = [v for vs in aug3.values() for v in vs]
+            cal.update(aug3={k: float(np.median(v)) for k, v in aug3.items()}, aug3_lo=float(np.percentile(all3, 5)), aug3_n=len(all3))
+        if augt:
+            allt = [v for vs in augt.values() for v in vs]
+            cal.update(augt={k: float(np.median(v)) for k, v in augt.items()}, augt_lo=float(np.percentile(allt, 5)), augt_n=len(allt))
         lo = min([cal[k] for k in ('same_lo', 'aug_lo') if k in cal] or [1.0])
         if diff and lo > cal['diff_hi'] + 0.03:
             cal['copy'] = float(min(DEFAULTS['copy_threshold'], max(0.7, lo - 0.02, cal['diff_hi'] + 0.02)))
+        floor3 = cal['vox_diff_hi'] + 0.05 if strict else 0.65
+        line3 = 0.8
         if strict:
-            cal['vox_copy'] = float(min(0.92, max(0.8, cal['vox_diff_hi'] + 0.05)))
+            line3 = max(line3, floor3)
+        if aug3 and cal['aug3_lo'] - 0.02 < line3:
+            line3 = max(floor3, 0.65, cal['aug3_lo'] - 0.02)
+        cal['vox_copy'] = float(min(0.92, line3))
+        if augt:
+            cal['tex_copy'] = float(min(0.95, max(0.85, cal['augt_lo'] - 0.02)))
         kv_set(db, 'calib', cal)
         log(f'tuned on your items: {len(same)} recolour pairs, {len(diff)} different-model pairs')
     history(db)
@@ -1383,6 +1409,47 @@ def augment_scores(items):
                 pass
     return out
 
+def _rot(axis, deg):
+    c, s_ = (np.cos(np.radians(deg)), np.sin(np.radians(deg)))
+    i, j = [k for k in range(3) if k != axis]
+    r = np.eye(3)
+    r[i, i], r[i, j], r[j, i], r[j, j] = (c, -s_, s_, c)
+    return r
+AUG3 = {'turned 30°': lambda p, g: p @ _rot(2, 30).T, 'turned 90°': lambda p, g: p @ _rot(1, 90).T, 'tilted 17°+40°': lambda p, g: p @ (_rot(0, 17) @ _rot(1, 40)).T, 'upside down': lambda p, g: p @ _rot(0, 180).T, 'mirrored': lambda p, g: p * [-1, 1, 1], '3x bigger': lambda p, g: p * 3 + 5, 'stretched 10%': lambda p, g: p * [1.1, 1, 1], 're-saved (tiny noise)': lambda p, g: p + g.normal(0, 0.004, p.shape) * np.ptp(p, 0).max(), 'simplified (half the points)': lambda p, g: p[::2], 'everything at once': lambda p, g: p[::2] * [-1, 1, 1] @ (_rot(0, 17) @ _rot(2, 60)).T * 2 + g.normal(0, 0.003, (len(p[::2]), 3)) * np.ptp(p, 0).max()}
+
+def augment_models(items, meshes):
+    out, g = ({}, np.random.default_rng(1))
+    for m in items:
+        p = (meshes.get(m['id']) or {}).get('pts')
+        if p is None or len(p) < 100 or time.time() > HARD['t']:
+            continue
+        live_poll()
+        p = p.astype(np.float64)
+        base = _vox(p)
+        for name, f in AUG3.items():
+            try:
+                out.setdefault(name, []).append(float(vox_score(base, _vox(f(p, g)))[0]))
+            except Exception:
+                pass
+    return out
+AUGT = {'recoloured': lambda a: a[..., [2, 0, 1]], 'darker': lambda a: (a * 0.55).astype(np.uint8), 'brighter': lambda a: np.clip(a * 1.4 + 30, 0, 255).astype(np.uint8), 'inverted': lambda a: 255 - a, 'grey': lambda a: np.repeat(a.mean(-1, keepdims=True), 3, -1).astype(np.uint8), 'blurred': lambda a: np.asarray(Image.fromarray(a).filter(ImageFilter.GaussianBlur(1.5)))}
+
+def augment_textures(items, meshes):
+    out = {}
+    for m in items:
+        d = meshes.get(m['id']) or {}
+        t = d.get('tex_small')
+        if t is None or d.get('texv') is None:
+            continue
+        for name, f in AUGT.items():
+            try:
+                fa = tex_feats(Image.fromarray(f(t)))
+                if fa.get('texv') is not None:
+                    out.setdefault(name, []).append(float(texture_score(fa, tex_feats(Image.fromarray(t)))))
+            except Exception:
+                pass
+    return out
+
 def history(db):
     try:
         conf = [r[0] for r in db.execute("select visual from checked where ai like 'same%' or ai like 'remake%' or verdict like 'Likely COPY%'")]
@@ -1392,7 +1459,7 @@ def history(db):
     L = {'confirmed': len(conf), 'unrelated': len(unrel), 'checked': db.execute('select count(*) from checked').fetchone()[0]}
     if len(conf) >= 5:
         lo = float(np.percentile(conf, 10))
-        L.update(confirmed_lo=lo, scan_min_visual=float(min(0.5, max(0.35, lo - 0.05))), ai_min_visual=float(min(0.45, max(0.35, lo - 0.05))))
+        L.update(confirmed_lo=lo, scan_min_visual=float(min(0.42, max(0.35, lo - 0.05))), ai_min_visual=float(min(0.42, max(0.35, lo - 0.05))))
     if unrel:
         L['unrelated_hi'] = float(np.percentile(unrel, 95))
     kv_set(db, 'learn', L)
@@ -1403,6 +1470,8 @@ def learned(db, cfg):
         cfg['copy_threshold'] = min(cfg['copy_threshold'], cal['copy'])
     if cal.get('vox_copy'):
         cfg['vox_copy'] = cal['vox_copy']
+    if cal.get('tex_copy'):
+        cfg['tex_copy'] = min(0.95, cal['tex_copy'])
     for k in ('scan_min_visual', 'ai_min_visual'):
         if L.get(k):
             cfg[k] = min(cfg.get(k, 0.5), L[k])
@@ -1459,7 +1528,7 @@ def scan_shard(db, cfg, shard, total, minutes=24):
         log('no items of yours in the data yet')
         return
     stop = time.time() + minutes * 60
-    HARD['t'] = stop + 6 * 60
+    HARD['t'] = time.time() + cfg.get('scan_total_minutes', 34) * 60
     try:
         offenders = [r[0] for r in db.execute("select distinct creator from checked where verdict<>''")]
     except sqlite3.OperationalError:
@@ -1478,7 +1547,7 @@ def scan_shard(db, cfg, shard, total, minutes=24):
         done += 1
     fresh = [d for i, d in found.items() if not is_seen(db, i)]
     log(f'searched {done} of {len(slices)} slices, {len(found)} items, {len(fresh)} not checked before')
-    keep, scored = ([], 0)
+    keep, scored, pic = ([], 0, {})
     for k in range(0, len(fresh), 200):
         if time.time() > HARD['t']:
             break
@@ -1492,15 +1561,86 @@ def scan_shard(db, cfg, shard, total, minutes=24):
             cand['thumb'] = u
             res = judge(cand, feats[u][0], mine, cfg)
             scored += 1
-            if res and (res['verdict'] or res['visual'] >= cfg.get('scan_min_visual', 0.5) or res['name'] >= 0.6 or (res['desc'] >= 0.3) or res['credit']):
+            pic[i] = res['visual'] if res else 0.0
+            if res and (res['verdict'] or res['visual'] >= cfg.get('scan_min_visual', 0.42) or res['name'] >= 0.6 or (res['desc'] >= 0.3) or res['credit']):
                 keep.append((max(res['visual'], res['name'] * 0.9, res['desc']), d))
+    m3done, m3hits = scan_models(db, cfg, [d for d in fresh if d['id'] in pic], pic)
+    kept = {d['id'] for _, d in keep}
+    for d, g in m3hits:
+        if d['id'] not in kept:
+            keep.append((max(0.5, g.get('strict') or 0), d | {'_m3': g}))
     keep = [d | {'_score': round(s, 3)} for s, d in sorted(keep, key=lambda x: -x[0])]
     out = HERE / 'scan'
     out.mkdir(exist_ok=True)
     name = f"{os.environ.get('GITHUB_RUN_ID', int(time.time()))}-{shard}.json.gz"
-    stats = {'slices': done, 'of': len(slices), 'found': len(found), 'compared': scored, 'handed': len(keep), 'total': total}
-    (out / name).write_bytes(gzip.compress(json.dumps({'stats': stats, 'items': keep}).encode()))
-    log(f'compared {scored} items by picture, {len(keep)} look-alikes handed to the watcher')
+    stats = {'slices': done, 'of': len(slices), 'found': len(found), 'compared': scored, 'handed': len(keep), 'total': total, 'models': len(m3done), 'model_hits': len(m3hits)}
+    (out / name).write_bytes(gzip.compress(json.dumps({'stats': stats, 'items': keep, 'm3': m3done}).encode()))
+    log(f'compared {scored} items by picture, {len(m3done)} by 3D model, {len(keep)} look-alikes handed to the watcher')
+
+def scan_models(db, cfg, items, pic):
+    import pickle
+    if not cfg.get('roblox_cookie'):
+        return ([], [])
+    try:
+        mymods = [pickle.loads(r[0]) for r in db.execute('select blob from mymesh')]
+    except sqlite3.OperationalError:
+        mymods = []
+    try:
+        done_before = {r[0] for r in db.execute('select id from m3seen')}
+    except sqlite3.OperationalError:
+        done_before = set()
+    mymods = [m for m in mymods if m.get('mesh_id')]
+    if not mymods:
+        return ([], [])
+    mesh_ids = {m['mesh_id']: m for m in mymods}
+    tex_ids = {m['tex_id']: m for m in mymods if m.get('tex_id')}
+    names = {_inner_name(n).lower() for m in mymods for n in m.get('names', [])} - {''}
+    cache = {}
+    todo = sorted((d for d in items if d['id'] not in done_before), key=lambda d: -pic.get(d['id'], 0))
+
+    def one(d):
+        if time.time() > HARD['t']:
+            return None
+        try:
+            data = asset_bytes(d['id'], cfg)
+            ids = model_ids(data) if data else {}
+            if not ids.get('mesh'):
+                return (d['id'], None)
+            g = {'mesh_id': ids['mesh'], 'tex_id': ids.get('tex')}
+            if ids['mesh'] in mesh_ids:
+                g.update(same_mesh=True, mine=mesh_ids[ids['mesh']].get('mesh_id'))
+            if ids.get('tex') in tex_ids:
+                g['same_tex'] = True
+            inner = [x for x in map(_inner_name, ids.get('names', [])) if x and x.lower() in names]
+            if inner:
+                g['inner'] = inner[:2]
+            if not g.get('same_mesh'):
+                if ids['mesh'] not in cache:
+                    mb = asset_bytes(ids['mesh'], cfg)
+                    v, nf = mesh_geom(mb) if mb else (None, 0)
+                    ok = v is not None and len(v) >= 50 and np.isfinite(v).any()
+                    cache[ids['mesh']] = {'vox': _vox(v), 'hist': _d2(v[np.isfinite(v).all(1)]), 'n': len(v), 'nf': nf} if ok else None
+                t = cache[ids['mesh']]
+                if t:
+                    near = sorted(mymods, key=lambda m: -(mesh_score(t, m) or 0))[:4]
+                    best = max((vox_score(t['vox'], m.get('vox')) + (m,) for m in near if m.get('vox') is not None), key=lambda x: x[0] or 0, default=None)
+                    if best:
+                        g.update(strict=round(best[0], 3), slack=round(best[1], 3))
+                    g['counts'] = any((t['n'] >= 200 and t['n'] == m.get('n') and (t['nf'] == m.get('nf')) for m in mymods))
+            hit = g.get('same_mesh') or g.get('same_tex') or g.get('inner') or g.get('counts') or ((g.get('strict') or 0) >= 0.5) or ((g.get('slack') or 0) >= 0.85)
+            return (d['id'], g if hit else None)
+        except Exception:
+            return None
+    done, hits = ([], [])
+    byid = {d['id']: d for d in todo}
+    with ThreadPoolExecutor(8) as pool:
+        for r in pool.map(one, todo):
+            if r is None:
+                continue
+            done.append(r[0])
+            if r[1]:
+                hits.append((byid[r[0]], r[1]))
+    return (done, hits)
 
 def ingest_scans(db):
     db.execute('create table if not exists deep(id integer primary key, score real, raw text)')
@@ -1516,11 +1656,14 @@ def ingest_scans(db):
                 tot = {'run': run, 'at': time.time(), 'found': 0, 'compared': 0, 'handed': 0, 'files': 0, 'seen': [], 'slices': 0, 'of': 0}
             if f.name not in tot.setdefault('seen', []):
                 tot['total'] = st.get('total', tot.get('total', 10))
-                for k in ('found', 'compared', 'handed', 'slices', 'of'):
+                for k in ('found', 'compared', 'handed', 'slices', 'of', 'models', 'model_hits'):
                     tot[k] = tot.get(k, 0) + st.get(k, 0)
                 tot['files'] = tot.get('files', 0) + 1
                 tot['seen'].append(f.name)
             kv_set(db, 'scan_stats', tot)
+            db.execute('create table if not exists m3seen(id integer primary key)')
+            if isinstance(blob, dict):
+                db.executemany('insert or ignore into m3seen values(?)', [(i,) for i in blob.get('m3') or []])
             for d in items:
                 if not is_seen(db, d['id']):
                     db.execute('insert or ignore into deep values(?,?,?)', (d['id'], d.get('_score', 0), json.dumps(d)))
@@ -1530,7 +1673,9 @@ def ingest_scans(db):
         read.append(f'scan/{f.name}')
     db.commit()
     if read:
-        (HERE / 'ingested.txt').write_text('\n'.join(read) + '\n')
+        f = HERE / 'ingested.txt'
+        before = set(f.read_text().split()) if f.exists() else set()
+        f.write_text('\n'.join(sorted(before | set(read))) + '\n')
         log(f'catalog scanner: {n} new look-alikes from {len(read)} files')
 
 def _cycle(db, cfg):
@@ -1567,17 +1712,7 @@ def _cycle(db, cfg):
             db.commit()
             log(f'looked again at {len(ids)} items that were waiting for an AI review')
     ingest_scans(db)
-    rows = db.execute('select id, raw from deep order by score desc limit ?', (int(os.environ.get('DEEP_PER_RUN', 10 ** 9)),)).fetchall()
-    if rows and time.time() < deadline:
-        ids = [r[0] for r in rows]
-        db.execute(f"delete from deep where id in ({','.join(map(str, ids))})")
-        db.commit()
-        budget -= process(db, cfg, mine, [json.loads(r[1]) for r in rows], ACCESSORY | types, budget, 'scan')
-        back = [r for r in rows if not is_seen(db, r[0])]
-        for i, raw in back:
-            db.execute('insert or ignore into deep values(?,?,?)', (i, json.loads(raw).get('_score', 0), raw))
-        db.commit()
-        log(f"catalog scanner: checked {len(rows) - len(back)} look-alikes, {db.execute('select count(*) from deep').fetchone()[0]} still queued")
+    check_deep(db, cfg, mine, types)
 
 def live_poll(catch_up=False):
     if LIVE['busy'] or not LIVE.get('ctx'):
@@ -1693,13 +1828,48 @@ def flush_feed(cfg):
         send(cfg, {'username': 'UGC Watch', 'embeds': cards[k:k + 10]}, url)
         time.sleep(1.0)
 
+def check_deep(db, cfg, mine, types):
+    rows = db.execute('select id, raw from deep order by score desc').fetchall()
+    if not rows:
+        return
+    ids = [r[0] for r in rows]
+    db.execute(f"delete from deep where id in ({','.join(map(str, ids))})")
+    db.commit()
+    process(db, cfg, mine, [json.loads(r[1]) for r in rows], ACCESSORY | types, cfg.get('max_alerts_per_cycle', 10 ** 9), 'scan')
+    back = [r for r in rows if not is_seen(db, r[0])]
+    for i, raw in back:
+        db.execute('insert or ignore into deep values(?,?,?)', (i, json.loads(raw).get('_score', 0), raw))
+    db.commit()
+    log(f"catalog scanner: checked {len(rows) - len(back)} look-alikes, {db.execute('select count(*) from deep').fetchone()[0]} still queued")
+
+def pull_scans():
+    import subprocess
+    if not (HERE / '.git').exists():
+        return False
+    try:
+        subprocess.run(['git', '-C', str(HERE), 'fetch', '-q', 'origin', 'main'], timeout=60, check=True)
+        names = subprocess.run(['git', '-C', str(HERE), 'ls-tree', '--name-only', 'origin/main', 'scan/'], capture_output=True, text=True, timeout=30).stdout.split()
+        new = [n for n in names if not (HERE / n).exists()]
+        if new:
+            subprocess.run(['git', '-C', str(HERE), 'checkout', 'origin/main', '--'] + new, timeout=60, check=True)
+        return bool(new)
+    except Exception as e:
+        log('scan pull failed:', repr(e)[:120])
+        return False
+
 def live_until_end():
     if not LIVE.get('ctx'):
         return
-    cfg = LIVE['ctx'][1]
+    db, cfg, mine, types = LIVE['ctx']
+    pulled = time.time()
     while time.time() < HARD['t'] - 75:
         live_poll()
-        time.sleep(max(1.0, cfg.get('live_poll_seconds', 20) - (time.time() - LIVE['last'])))
+        if time.time() - pulled > cfg.get('scan_pull_seconds', 240):
+            pulled = time.time()
+            if pull_scans():
+                ingest_scans(db)
+                check_deep(db, cfg, mine, types)
+        time.sleep(max(1.0, cfg.get('live_poll_seconds', 15) - (time.time() - LIVE['last'])))
 LIVE = {'ctx': None, 'last': 0, 'busy': False}
 
 def main():
