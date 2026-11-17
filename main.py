@@ -1102,6 +1102,8 @@ def process(db, cfg, mine, raw, types, budget, src='new'):
         cand['thumb'] = u if ok else ''
         feat, raw_png = feats[u] if ok else (None, None)
         sent += decide(db, cfg, mine, cand, feat, raw_png, budget - sent, src) or 0
+        if src == 'new':
+            post_feed(cfg, force=False)
     return sent
 
 def cycle(db, cfg):
@@ -1170,10 +1172,14 @@ def mesh_cards(m, colour=5793266):
 
 def post_activity(cfg):
     post_feed(cfg)
+FEED_AT = {'t': 0.0}
 
-def post_feed(cfg):
+def post_feed(cfg, force=True):
     url = cfg.get('feed_webhook_url')
     fresh = [e for e in ACTIVITY if e[0] == 'new']
+    if not force and len(fresh) < 3 and (time.time() - FEED_AT['t'] < 8):
+        return
+    FEED_AT['t'] = time.time()
     ACTIVITY[:] = [e for e in ACTIVITY if e[0] != 'new']
     if not url or not fresh:
         return
