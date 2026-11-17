@@ -45,13 +45,16 @@ jobs:
           python-version: "3.12"
       - run: pip install -q -r requirements.txt
       - name: Run the watcher
-        run: python ugc_watch.py --once --data data
+        run: |
+          if [ -z "$DISCORD_WEBHOOK_URL" ]; then echo "secrets not set up yet, skipping"; exit 0; fi
+          python ugc_watch.py --once --data data
       - name: Save memory to the private repo
         if: always()
         working-directory: data
         run: |
           git config user.name "ugc-watch"
           git config user.email "ugc-watch@users.noreply.github.com"
+          [ -n "$DISCORD_WEBHOOK_URL" ] || exit 0
           [ -f ugc_watch.db ] || exit 0
           for attempt in 1 2 3 4; do
             git fetch -q origin main
