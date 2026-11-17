@@ -1812,6 +1812,9 @@ def live_poll(catch_up=False):
         db.execute('create table if not exists fed(id integer primary key, at real)')
         db.execute('create table if not exists feedwait(id integer primary key, at real)')
         first = not kv_get(db, 'feed_since')
+        if catch_up and (not first) and (not kv_get(db, 'feedwait_v2')):
+            clear_backlog(db)
+            kv_set(db, 'feedwait_v2', 1)
         if first:
             kv_set(db, 'feed_since', time.time())
         cut = time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(time.time() - cfg.get('feed_max_age_days', 3) * 86400))
@@ -1853,6 +1856,23 @@ def live_poll(catch_up=False):
     finally:
         LIVE['busy'] = False
         LIVE['last'] = time.time()
+
+def clear_backlog(db):
+    db.execute('create table if not exists deep(id integer primary key, score real, raw text)')
+    ids = [r[0] for r in db.execute('select id from feedwait')]
+    if not ids:
+        return
+    items = details_batch(ids)
+    for i in set(ids) - {d['id'] for d in items}:
+        db.execute('delete from feedwait where id=?', (i,))
+    late = [d for d in items if d.get('price') is not None or d.get('lowestPrice') is not None]
+    for d in late:
+        db.execute('insert or ignore into fed values(?,?)', (d['id'], time.time()))
+        db.execute('delete from feedwait where id=?', (d['id'],))
+        if not is_seen(db, d['id']):
+            db.execute('insert or ignore into deep values(?,?,?)', (d['id'], 0, json.dumps(d)))
+    db.commit()
+    log(f"feed: cleared {len(late)} late listings into the copy check, {db.execute('select count(*) from feedwait').fetchone()[0]} still waiting")
 
 def feed_items(db, cfg, mine, types, items, cut, recheck=False):
     show = []
