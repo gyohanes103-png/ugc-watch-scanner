@@ -16,10 +16,10 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 360
     env:
       PUBLIC_LOG: "1"
-      RUN_MINUTES: "27"
+      RUN_MINUTES: "345"
       DEEP_PER_RUN: "1000000000"
       DATA_REPO: ${{ secrets.DATA_REPO }}
       DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
