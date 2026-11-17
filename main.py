@@ -1033,7 +1033,7 @@ def decide(db, cfg, mine, cand, feat, raw_png, left, src='new'):
             STATS['mesh'] += 1
             r, vox = (g['render'], g['vox'])
             slack = g['slack']
-            copy = g['same_mesh'] or (vox or 0) >= 0.8 or (g['counts'] and (slack or 0) >= 0.95) or (vox is None and (r or 0) >= 0.92)
+            copy = g['same_mesh'] or (vox or 0) >= cfg.get('vox_copy', 0.8) or (g['counts'] and (slack or 0) >= 0.95) or (vox is None and (r or 0) >= 0.92)
             res.update(mesh=1.0 if copy else min(vox, 0.98) if vox is not None else None, render=r, texsim=g['texsim'], tex=g['same_tex'], mesh_info=theirs.get('mesh_info'))
             mm = {'id': m['id'], 'name': m['name'], 'thumb': m.get('thumb', ''), 'created': m.get('created', '')}
             res['m3d'] = {'theirs': theirs, 'yours': d, 'mine_name': m['name'], 'mine_id': m['id'], 'score': vox, 'render': r, 'texsim': g['texsim'], 'same_tex': g['same_tex'], 'counts': g['counts'], 'same_mesh': g['same_mesh'], 'inner': g['inner']}
@@ -1234,6 +1234,9 @@ def report(db, cfg, started):
     near = db.execute("select id,name,visual,creator from checked where at>=? and verdict='' and visual>=0.43 and (ai like 'similar%' or ai like 'remake%' or ai like 'same%' or (ai='' and visual>=0.6)) order by visual desc limit 6", (started,)).fetchall()
     if near:
         lines += ['', '**Closest ones not flagged**'] + [f'`{pct(r[2]):>4.0%}` [{r[1][:50]}](https://www.roblox.com/catalog/{r[0]}) · {r[3][:22]}' for r in near]
+    cal = kv_get(db, 'calib', {})
+    if cal.get('same_n'):
+        lines.append(f"Tuned on your own items: your recolours look **{cal['same_lo']:.0%}+** alike, your different models up to **{cal.get('diff_hi', 0):.0%}**; copy line **{cfg['copy_threshold']:.0%}**, 3D copy line **{cfg.get('vox_copy', 0.8):.0%}**")
     sp = kv_get(db, 'ai_spend', {})
     if sp.get('total'):
         lines += ['', f"AI spend: ${sp.get(time.strftime('%Y-%m-%d'), 0):.3f} today, ${sp['total']:.2f} in total"]
@@ -1261,6 +1264,48 @@ def digest(db, cfg):
     body = '\n'.join((f'[{r[1][:60]}](https://www.roblox.com/catalog/{r[0]}) by {r[2][:30]} · {pct(r[3]):.0%} like your {r[4][:40]}' for r in rs)) or 'No takedown-worthy cases this week.'
     send(cfg, {'username': 'UGC Watch', 'embeds': [{'title': f"Weekly digest: {len(rs)} case{('s' if len(rs) != 1 else '')} worth a takedown look", 'color': 10181046, 'description': body[:4000], 'footer': {'text': 'Week ending'}, 'timestamp': stamp()}]})
     kv_set(db, 'digest_at', time.time())
+
+def calibrate(db, cfg, mine):
+    import pickle
+    try:
+        meshes = {r[0]: pickle.loads(r[1]) for r in db.execute('select id, blob from mymesh')}
+    except sqlite3.OperationalError:
+        return
+    items = [m for m in mine if m['feat'] is not None and (meshes.get(m['id']) or {}).get('mesh_id')]
+    key = f"{len(items)}:{sum((m['id'] for m in items)) % 999983}"
+    cal = kv_get(db, 'calib', {})
+    if cal.get('key') != key and len(items) >= 6:
+        same, diff, vdiff, rng = ([], [], [], np.random.default_rng(0))
+        for k, a in enumerate(items):
+            for b in items[k + 1:]:
+                v = max(visual_score(a['feat'], b['feat'])[0], visual_score(b['feat'], a['feat'])[0])
+                ma, mb = (meshes[a['id']], meshes[b['id']])
+                if ma['mesh_id'] == mb['mesh_id'] or (ma.get('sha') and ma.get('sha') == mb.get('sha')):
+                    same.append(v)
+                else:
+                    diff.append(v)
+                    if ma.get('vox') is not None and mb.get('vox') is not None:
+                        vdiff.append((ma['vox'], mb['vox']))
+        if len(vdiff) > 250:
+            vdiff = [vdiff[i] for i in rng.choice(len(vdiff), 250, replace=False)]
+        strict = [vox_score(x, y)[0] for x, y in vdiff]
+        cal = {'key': key, 'items': len(items), 'same_n': len(same), 'diff_n': len(diff), 'at': time.time()}
+        if same:
+            cal.update(same_lo=float(np.percentile(same, 10)), same_min=float(min(same)), same_med=float(np.median(same)))
+        if diff:
+            cal.update(diff_hi=float(np.percentile(diff, 99)), diff_max=float(max(diff)))
+        if strict:
+            cal.update(vox_diff_hi=float(np.percentile(strict, 99)), vox_diff_max=float(max(strict)))
+        if same and diff and (cal['same_lo'] > cal['diff_hi'] + 0.03):
+            cal['copy'] = float(min(DEFAULTS['copy_threshold'], max(0.7, cal['same_lo'] - 0.02, cal['diff_hi'] + 0.02)))
+        if strict:
+            cal['vox_copy'] = float(min(0.92, max(0.8, cal['vox_diff_hi'] + 0.05)))
+        kv_set(db, 'calib', cal)
+        log(f'tuned on your items: {len(same)} recolour pairs, {len(diff)} different-model pairs')
+    if cal.get('copy'):
+        cfg['copy_threshold'] = cal['copy']
+    if cal.get('vox_copy'):
+        cfg['vox_copy'] = cal['vox_copy']
 
 def selftest(db, cfg):
     if not load_mine(db):
@@ -1338,7 +1383,7 @@ def scan_shard(db, cfg, shard, total, minutes=24):
             scored += 1
             if res and (res['verdict'] or res['visual'] >= cfg.get('scan_min_visual', 0.5) or res['name'] >= 0.6 or (res['desc'] >= 0.3) or res['credit']):
                 keep.append((max(res['visual'], res['name'] * 0.9, res['desc']), d))
-    keep = [d | {'_score': round(s, 3)} for s, d in sorted(keep, key=lambda x: -x[0])[:cfg.get('scan_max_per_shard', 400)]]
+    keep = [d | {'_score': round(s, 3)} for s, d in sorted(keep, key=lambda x: -x[0])]
     out = HERE / 'scan'
     out.mkdir(exist_ok=True)
     name = f"{os.environ.get('GITHUB_RUN_ID', int(time.time()))}-{shard}.json.gz"
@@ -1389,6 +1434,11 @@ def _cycle(db, cfg):
     deadline = time.time() + cfg['max_run_minutes'] * 60
     LIVE.update(ctx=(db, cfg, mine, types), last=0, busy=False)
     live_poll(catch_up=True)
+    if cfg.get('roblox_cookie') and (not kv_get(db, 'mymesh_full')):
+        MYM['list'] = my_models(db, cfg, mine)
+        if db.execute('select count(*) from mymesh').fetchone()[0] >= len(mine) - 2:
+            kv_set(db, 'mymesh_full', 1)
+    calibrate(db, cfg, mine)
     if ai_ready(cfg, db):
         ids = [r[0] for r in db.execute('select id from later limit ?', (int(os.environ.get('DEEP_PER_RUN', 150)),))]
         if ids:
@@ -1480,10 +1530,10 @@ def live_poll(catch_up=False):
                 else:
                     show.append(d)
             show.sort(key=lambda d: d.get('itemCreatedUtc') or '')
-            for k in range(0, len(show), 5):
-                chunk = show[k:k + 5]
-                process(db, cfg, mine, chunk, ACCESSORY | types, cfg.get('max_alerts_per_cycle', 40))
-                posted += feed_cards(db, cfg, chunk)
+            for d in show:
+                process(db, cfg, mine, [d], ACCESSORY | types, cfg.get('max_alerts_per_cycle', 40))
+                posted += feed_cards(db, cfg, [d])
+            flush_feed(cfg)
             db.commit()
         db.commit()
         if got:
@@ -1522,11 +1572,21 @@ def feed_cards(db, cfg, items):
             card['thumbnail'] = {'url': u}
         cards.append(card)
     if url:
-        for k in range(0, len(cards), 10):
-            send(cfg, {'username': 'UGC Watch', 'embeds': cards[k:k + 10]}, url)
-            time.sleep(1.0)
+        if cards and (not FEEDBUF['cards']):
+            FEEDBUF['since'] = time.time()
+        FEEDBUF['cards'] += cards
+        if len(FEEDBUF['cards']) >= 10 or time.time() - FEEDBUF['since'] >= 3:
+            flush_feed(cfg)
     STATS['live'] += len(cards)
     return len(cards)
+FEEDBUF = {'cards': [], 'since': 0.0}
+
+def flush_feed(cfg):
+    url = cfg.get('feed_webhook_url')
+    cards, FEEDBUF['cards'] = (FEEDBUF['cards'], [])
+    for k in range(0, len(cards), 10):
+        send(cfg, {'username': 'UGC Watch', 'embeds': cards[k:k + 10]}, url)
+        time.sleep(1.0)
 
 def live_until_end():
     if not LIVE.get('ctx'):
