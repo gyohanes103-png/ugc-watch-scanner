@@ -1252,7 +1252,7 @@ def cycle(db, cfg):
     PENDING.clear()
     TIERS.clear()
     started = time.time()
-    LIVE.update(ctx=None, last=0, busy=False)
+    LIVE.update(ctx=None, last=0, busy=False, seg=None, saving=False)
     seg = started
     try:
         _cycle(db, cfg)
@@ -1857,6 +1857,20 @@ def live_poll(catch_up=False):
     finally:
         LIVE['busy'] = False
         LIVE['last'] = time.time()
+    if not catch_up:
+        checkpoint_due()
+
+def checkpoint_due():
+    if not LIVE.get('seg') or LIVE.get('saving') or (not LIVE.get('ctx')):
+        return
+    db, cfg, mine, types = LIVE['ctx']
+    if time.time() - LIVE['seg'] < cfg.get('summary_minutes', 30) * 60:
+        return
+    LIVE['saving'] = True
+    try:
+        LIVE['seg'] = checkpoint(db, cfg, mine, LIVE['seg'])
+    finally:
+        LIVE['saving'] = False
 
 def clear_backlog(db):
     db.execute('create table if not exists deep(id integer primary key, score real, raw text)')
@@ -1988,7 +2002,8 @@ def live_until_end(started):
     if not LIVE.get('ctx'):
         return started
     db, cfg, mine, types = LIVE['ctx']
-    pulled, seg = (time.time(), started)
+    pulled = time.time()
+    LIVE['seg'] = started
     while time.time() < HARD['t'] - 120:
         live_poll()
         if time.time() - pulled > cfg.get('scan_pull_seconds', 240):
@@ -1996,10 +2011,9 @@ def live_until_end(started):
             if pull_scans():
                 ingest_scans(db)
         check_deep(db, cfg, mine, types, chunk=cfg.get('deep_chunk', 25))
-        if time.time() - seg > cfg.get('summary_minutes', 30) * 60:
-            seg = checkpoint(db, cfg, mine, seg)
+        checkpoint_due()
         time.sleep(max(0.5, cfg.get('live_poll_seconds', 15) - (time.time() - LIVE['last'])))
-    return seg
+    return LIVE.pop('seg')
 
 def checkpoint(db, cfg, mine, seg):
     merge_limits(db, LIMIT.export())
