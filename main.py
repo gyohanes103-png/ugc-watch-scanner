@@ -2,14 +2,14 @@ import argparse, base64, calendar, difflib, gzip, hashlib, io, itertools, json, 
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import requests
-from PIL import Image
+from PIL import Image, ImageFilter, ImageOps
 HERE = pathlib.Path(__file__).resolve().parent
 CATALOG = 'https://catalog.roblox.com/v1/search/items/details'
 THUMBS = 'https://thumbnails.roblox.com/v1/assets'
 SUBCAT = {46: 25, 47: 26}
 COLOURS = set('black white grey gray red blue pink purple violet green yellow orange brown\nlight dark pastel neon gold golden silver cyan teal lavender beige cream blonde ginger\nombre rainbow and'.split())
 STOP = set('the a an of for with to in on my your our is it its this that very'.split())
-DEFAULTS = {'discord_webhook_url': '', 'my_creator_id': 0, 'my_creator_type': 'Group', 'ignore_creator_ids': [], 'extra_asset_types': [], 'poll_minutes': 5, 'feed_pages': 6, 'sweep_hours': 12, 'sweep_pages': 15, 'refresh_my_items_hours': 6, 'copy_threshold': 0.8, 'remake_threshold': 0.63, 'combo_threshold': 0.5, 'ai_provider': 'auto', 'anthropic_api_key': '', 'gemini_api_key': '', 'anthropic_workspace_id': '', 'anthropic_model': 'claude-haiku-5-5', 'gemini_model': 'gemini-3.5-flash', 'ai_min_visual': 0.45, 'ai_max_calls_per_day': 300, 'text_alerts': True, 'max_alerts_per_cycle': 40, 'status_updates': 'every_run', 'max_run_minutes': 12}
+DEFAULTS = {'discord_webhook_url': '', 'my_creator_id': 0, 'my_creator_type': 'Group', 'ignore_creator_ids': [], 'extra_asset_types': [], 'poll_minutes': 5, 'feed_pages': 6, 'sweep_hours': 12, 'sweep_pages': 15, 'refresh_my_items_hours': 6, 'copy_threshold': 0.8, 'remake_threshold': 0.63, 'combo_threshold': 0.5, 'ai_provider': 'auto', 'anthropic_api_key': '', 'gemini_api_key': '', 'anthropic_workspace_id': '', 'anthropic_model': 'claude-haiku-5-5', 'gemini_model': 'gemini-3.5-flash', 'ai_min_visual': 0.45, 'ai_max_calls_per_day': 10 ** 9, 'text_alerts': True, 'max_alerts_per_cycle': 10 ** 9, 'status_updates': 'every_run', 'max_run_minutes': 12}
 sess = requests.Session()
 sess.headers['User-Agent'] = 'Mozilla/5.0 (ugc-watch; personal IP monitoring)'
 AI_DOWN = set()
@@ -118,9 +118,44 @@ def _variants(a):
                 a['var'].append((_sdf_like(m), _hog(g, m), a['aspect'] if r % 2 == 0 else 1 / a['aspect'], 1.0 if r == 0 else 0.92, flip or r > 0))
     return a['var']
 
+def _turned(grey, mask, deg):
+    m = np.asarray(Image.fromarray(mask.astype(np.float32)).rotate(deg, Image.BILINEAR, expand=True)) > 0.5
+    g = np.asarray(Image.fromarray(grey.astype(np.float32)).rotate(deg, Image.BILINEAR, expand=True))
+    if m.sum() < 20:
+        return None
+    ys, xs = np.where(m)
+    y0, y1, x0, x1 = (ys.min(), ys.max() + 1, xs.min(), xs.max() + 1)
+    h, w = (y1 - y0, x1 - x0)
+    side = max(h, w)
+    G = np.zeros((side, side), np.float32)
+    M = np.zeros((side, side), np.float32)
+    oy, ox = ((side - h) // 2, (side - w) // 2)
+    G[oy:oy + h, ox:ox + w] = g[y0:y1, x0:x1] * m[y0:y1, x0:x1]
+    M[oy:oy + h, ox:ox + w] = m[y0:y1, x0:x1]
+    G = np.asarray(Image.fromarray(G).resize((N, N), Image.BILINEAR))
+    M = np.asarray(Image.fromarray(M).resize((N, N), Image.BILINEAR)) > 0.5
+    return (G * M, M, w / h)
+
+def _turned_variants(a):
+    if 'tvar' not in a:
+        a['tvar'] = []
+        for deg in (-16, -8, 8, 16):
+            for flip in (False, True):
+                g0, m0 = (a['grey'][:, ::-1], a['mask'][:, ::-1]) if flip else (a['grey'], a['mask'])
+                t = _turned(g0, m0, deg)
+                if t:
+                    g, m, asp = t
+                    a['tvar'].append((_sdf_like(m), _hog(g, m), asp, 0.9, True))
+    return a['tvar']
+
+def _plain(a, b):
+    soft, hog, aspect = _variants(a)[0][:3]
+    shape = float(np.minimum(soft, b['soft']).sum() / (np.maximum(soft, b['soft']).sum() + 1e-06))
+    return shape * (0.5 + 0.5 * min(aspect, b['aspect']) / max(aspect, b['aspect']))
+
 def visual_score(a, b):
     best = (0.0, 0.0, 0.0, False)
-    for soft, hog, aspect, weight, changed in _variants(a):
+    for soft, hog, aspect, weight, changed in _variants(a) + (_turned_variants(a) if _plain(a, b) >= 0.25 else []):
         shape = float(np.minimum(soft, b['soft']).sum() / (np.maximum(soft, b['soft']).sum() + 1e-06))
         detail = float(np.dot(hog, b['hog']))
         shape *= 0.5 + 0.5 * min(aspect, b['aspect']) / max(aspect, b['aspect'])
@@ -978,7 +1013,7 @@ def my_models(db, cfg, mine):
         db.execute('delete from mymesh')
         kv_set(db, 'mymesh_v3', 1)
         have = {}
-    todo = [m for m in mine if m['id'] not in have][:40]
+    todo = [m for m in mine if m['id'] not in have]
     for m in todo:
         if time.time() > HARD['t']:
             break
@@ -996,7 +1031,7 @@ def decide(db, cfg, mine, cand, feat, raw_png, left, src='new'):
     STATS['checked'] += 1
     res = judge(cand, feat, mine, cfg)
     wants = bool(res and (res['verdict'] or res['visual'] >= cfg['ai_min_visual'] or res['name'] >= 0.6 or (res['desc'] >= 0.3) or res['credit']) and res['visual_match'])
-    if wants and ai_provider(cfg) and (left <= 0 or not ai_ready(cfg, db)) and (db.execute('select count(*) from later').fetchone()[0] < 5000):
+    if wants and ai_provider(cfg) and (left <= 0 or not ai_ready(cfg, db)):
         db.execute('insert or ignore into later values(?)', (cand['id'],))
         mark(db, cand['id'])
         db.commit()
@@ -1216,42 +1251,46 @@ def report(db, cfg, started):
     now = time.time()
     starts = (kv_get(db, 'starts', []) + [int(started)])[-7:]
     kv_set(db, 'starts', starts)
-    gaps = sorted((b - a for a, b in zip(starts, starts[1:]) if b - a >= 20 * 60))
-    nxt = int(started) + min(gaps[len(gaps) // 2] if gaps else 3600, 6 * 3600)
+    gaps = sorted((y - x for x, y in zip(starts, starts[1:]) if y - x >= 20 * 60))
+    nxt = int(started) + min(gaps[len(gaps) // 2] if gaps else 1800, 6 * 3600)
     n_mine = db.execute('select count(*) from mine').fetchone()[0]
-    t = TIERS
-    found = [f'**{t[k]}** {name}' for k, name in (('strong', 'strong takedown case'), ('possible', 'possible takedown case'), ('remake', 'possible remake'), ('text', 'copied listing text'), ('similar', 'similar look and name')) if t.get(k)]
-    items = [f'[{nm[:60]}](https://www.roblox.com/catalog/{i}) · {cr[:24]} · {TIER_NAMES.get(k, k)}' for k, i, nm, cr in PENDING.get('found', [])[:20]]
-    if items:
-        found += [''] + items
-    lines = ['\n'.join(found) if found else 'No new look-alikes.', '', f"Fully checked **{STATS['checked']}** items against your **{n_mine}** in {max(1, round((now - started) / 60))} min", f'Checked <t:{int(now)}:f>', f'Next check around <t:{nxt}:f>']
+    found = PENDING.get('found', [])
+    if found:
+        desc = [f'**[{nm[:60]}](https://www.roblox.com/catalog/{i})** by {cr[:24]} · {TIER_NAMES.get(k, k)}' for k, i, nm, cr in found[:20]]
+        if len(found) > 20:
+            desc.append(f'...and {len(found) - 20} more in the alerts above')
+    else:
+        desc = ['Nothing new looks like your items.']
+    near = db.execute("select id,name,visual,creator from checked where at>=? and verdict='' and visual>=0.43 and (ai like 'similar%' or ai like 'remake%' or ai like 'same%' or (ai='' and visual>=0.6)) order by visual desc limit 5", (started,)).fetchall()
+    fields = []
+    add = lambda n, v, inline=True: fields.append({'name': n, 'value': v, 'inline': inline})
+    add('Live feed', f"**{STATS.get('live', 0)}** new uploads posted")
+    add('Full checks', f"**{STATS['checked']}** items vs your **{n_mine}**\n**{STATS['mesh']}** 3D models compared")
     sc = kv_get(db, 'scan_stats', {})
+    queued = db.execute('select count(*) from deep').fetchone()[0] if db.execute("select 1 from sqlite_master where name='deep'").fetchone() else 0
     if sc.get('files'):
-        queued = db.execute('select count(*) from deep').fetchone()[0] if db.execute("select 1 from sqlite_master where name='deep'").fetchone() else 0
-        lines += [f"Catalog scanner (<t:{int(sc['at'])}:R>, {sc['files']}/10 machines in): " + (f"compared **{sc['compared']:,}** items by picture, " if sc.get('compared') else f"searched **{sc['found']:,}** items, " if sc.get('found') else '') + f"**{sc['handed']}** look-alikes sent for the full check, **{queued}** still queued"]
-    if STATS.get('live'):
-        lines.append(f"New uploads watched live: **{STATS['live']}** posted to the feed as they appeared")
-    near = db.execute("select id,name,visual,creator from checked where at>=? and verdict='' and visual>=0.43 and (ai like 'similar%' or ai like 'remake%' or ai like 'same%' or (ai='' and visual>=0.6)) order by visual desc limit 6", (started,)).fetchall()
-    if near:
-        lines += ['', '**Closest ones not flagged**'] + [f'`{pct(r[2]):>4.0%}` [{r[1][:50]}](https://www.roblox.com/catalog/{r[0]}) · {r[3][:22]}' for r in near]
-    cal = kv_get(db, 'calib', {})
+        add('Catalog scan', (f"**{sc['compared']:,}** compared by picture\n" if sc.get('compared') else '') + f"**{sc['handed']:,}** sent for full checks" + (f', **{queued}** waiting' if queued else '') + f"\n{sc['files']}/{sc.get('total', 10)} machines · <t:{int(sc['at'])}:R>")
+    cal, L = (kv_get(db, 'calib', {}), kv_get(db, 'learn', {}))
+    learn = [f"Copy line **{cfg['copy_threshold']:.0%}** · 3D **{cfg.get('vox_copy', 0.8):.0%}**"]
     if cal.get('same_n'):
-        lines.append(f"Tuned on your own items: your recolours look **{cal['same_lo']:.0%}+** alike, your different models up to **{cal.get('diff_hi', 0):.0%}**; copy line **{cfg['copy_threshold']:.0%}**, 3D copy line **{cfg.get('vox_copy', 0.8):.0%}**")
+        learn.append(f"From {cal['same_n']} recolour pairs, {cal.get('diff_n', 0)} different-model pairs" + (f", {cal['aug_n']} turned/flipped/recoloured views" if cal.get('aug_n') else ''))
+    if L.get('checked'):
+        learn.append(f"{L['checked']:,} past checks · {L.get('confirmed', 0)} copies/remakes confirmed")
+    add('Learned', '\n'.join(learn))
     sp = kv_get(db, 'ai_spend', {})
-    if sp.get('total'):
-        lines += ['', f"AI spend: ${sp.get(time.strftime('%Y-%m-%d'), 0):.3f} today, ${sp['total']:.2f} in total"]
+    ai = f"${sp.get(time.strftime('%Y-%m-%d'), 0):.2f} today" if sp.get('total') else 'not used yet'
     waiting = db.execute('select count(*) from later').fetchone()[0]
-    if waiting:
-        lines.append(f'Waiting for an AI review: **{waiting}** items, checked as the daily budget allows')
+    add('Claude review', ai + (f'\n**{waiting}** waiting' if waiting else '') + (f"\n{STATS['note']}" if STATS['note'] else ''))
     user = roblox_user(cfg)
-    lines.append('3D model check: off, no Roblox cookie set' if user is None else f"3D model check: signed in to Roblox as **{user}**, {STATS['mesh']} models compared" + (f", {STATS['mesh_fail']} could not be fetched" if STATS['mesh_fail'] else '') if user else '3D model check: Roblox sign-in FAILED, the cookie has expired or is wrong')
-    if STATS['note']:
-        lines.append('AI problem: ' + STATS['note'])
+    add('Roblox sign-in', 'off (no cookie)' if user is None else f'**{user}**' if user else '**FAILED**: cookie expired')
+    add('This run', f'{max(1, round((now - started) / 60))} min · next <t:{nxt}:R>')
+    if near:
+        add('Closest not flagged', '\n'.join((f'`{pct(r[2]):>4.0%}` [{r[1][:45]}](https://www.roblox.com/catalog/{r[0]}) · {r[3][:20]}' for r in near)), False)
     repo = os.environ.get('DATA_REPO') or os.environ.get('GITHUB_REPOSITORY')
     if repo:
-        lines.append(f'[Full report](https://github.com/{repo}/blob/main/REPORT.md)')
-    title = f"{a} new look-alike{('s' if a != 1 else '')} found" if a else 'All clear'
-    send(cfg, {'username': 'UGC Watch', 'embeds': [{'title': title, 'color': 15105570 if a else 3066993, 'description': '\n'.join(lines), 'timestamp': stamp()}]})
+        desc.append(f'\n[Full report](https://github.com/{repo}/blob/main/REPORT.md)')
+    title = f"{a} possible cop{('ies' if a != 1 else 'y')} found" if a else 'All clear'
+    send(cfg, {'username': 'UGC Watch', 'embeds': [{'author': {'name': 'UGC Watch · run summary'}, 'title': title, 'color': 15105570 if a else 3066993, 'description': '\n'.join(desc), 'fields': fields, 'footer': {'text': 'Checked'}, 'timestamp': stamp()}]})
 
 def digest(db, cfg):
     last = kv_get(db, 'digest_at', 0)
@@ -1270,13 +1309,14 @@ def calibrate(db, cfg, mine):
     try:
         meshes = {r[0]: pickle.loads(r[1]) for r in db.execute('select id, blob from mymesh')}
     except sqlite3.OperationalError:
-        return
+        meshes = {}
     items = [m for m in mine if m['feat'] is not None and (meshes.get(m['id']) or {}).get('mesh_id')]
-    key = f"{len(items)}:{sum((m['id'] for m in items)) % 999983}"
+    key = f"{len(items)}:{sum((m['id'] for m in items)) % 999983}:{time.strftime('%Y-%m-%d')}"
     cal = kv_get(db, 'calib', {})
     if cal.get('key') != key and len(items) >= 6:
         same, diff, vdiff, rng = ([], [], [], np.random.default_rng(0))
         for k, a in enumerate(items):
+            live_poll()
             for b in items[k + 1:]:
                 v = max(visual_score(a['feat'], b['feat'])[0], visual_score(b['feat'], a['feat'])[0])
                 ma, mb = (meshes[a['id']], meshes[b['id']])
@@ -1286,9 +1326,13 @@ def calibrate(db, cfg, mine):
                     diff.append(v)
                     if ma.get('vox') is not None and mb.get('vox') is not None:
                         vdiff.append((ma['vox'], mb['vox']))
+        aug = augment_scores(items)
         if len(vdiff) > 250:
             vdiff = [vdiff[i] for i in rng.choice(len(vdiff), 250, replace=False)]
-        strict = [vox_score(x, y)[0] for x, y in vdiff]
+        strict = []
+        for x, y in vdiff:
+            live_poll()
+            strict.append(vox_score(x, y)[0])
         cal = {'key': key, 'items': len(items), 'same_n': len(same), 'diff_n': len(diff), 'at': time.time()}
         if same:
             cal.update(same_lo=float(np.percentile(same, 10)), same_min=float(min(same)), same_med=float(np.median(same)))
@@ -1296,16 +1340,72 @@ def calibrate(db, cfg, mine):
             cal.update(diff_hi=float(np.percentile(diff, 99)), diff_max=float(max(diff)))
         if strict:
             cal.update(vox_diff_hi=float(np.percentile(strict, 99)), vox_diff_max=float(max(strict)))
-        if same and diff and (cal['same_lo'] > cal['diff_hi'] + 0.03):
-            cal['copy'] = float(min(DEFAULTS['copy_threshold'], max(0.7, cal['same_lo'] - 0.02, cal['diff_hi'] + 0.02)))
+        if aug:
+            allv = [v for vs in aug.values() for v in vs]
+            cal.update(aug={k: float(np.median(v)) for k, v in aug.items()}, aug_lo=float(np.percentile(allv, 10)), aug_n=len(allv))
+        lo = min([cal[k] for k in ('same_lo', 'aug_lo') if k in cal] or [1.0])
+        if diff and lo > cal['diff_hi'] + 0.03:
+            cal['copy'] = float(min(DEFAULTS['copy_threshold'], max(0.7, lo - 0.02, cal['diff_hi'] + 0.02)))
         if strict:
             cal['vox_copy'] = float(min(0.92, max(0.8, cal['vox_diff_hi'] + 0.05)))
         kv_set(db, 'calib', cal)
         log(f'tuned on your items: {len(same)} recolour pairs, {len(diff)} different-model pairs')
+    history(db)
+    learned(db, cfg)
+AUG = {'turned 12°': lambda im: im.rotate(12, expand=True), 'turned -12°': lambda im: im.rotate(-12, expand=True), 'turned 25°': lambda im: im.rotate(25, expand=True), 'mirrored': lambda im: im.transpose(Image.FLIP_LEFT_RIGHT), 'upside down': lambda im: im.transpose(Image.FLIP_TOP_BOTTOM), 'quarter turn': lambda im: im.transpose(Image.ROTATE_90), 'smaller': lambda im: _pad(im.resize((im.width * 2 // 3, im.height * 2 // 3)), im.size), 'recoloured': lambda im: Image.merge('RGBA', (lambda c: (c[2], c[0], c[1], c[3]))(im.split())), 'inverted colours': lambda im: Image.merge('RGBA', (lambda c: (*(ImageOps.invert(x) for x in c[:3]), c[3]))(im.split())), 'grey': lambda im: Image.merge('RGBA', (*[im.convert('L')] * 3, im.split()[3])), 'blurred': lambda im: im.filter(ImageFilter.GaussianBlur(2))}
+
+def _pad(im, size):
+    out = Image.new('RGBA', size, (0, 0, 0, 0))
+    out.paste(im, ((size[0] - im.width) // 2, (size[1] - im.height) // 2))
+    return out
+
+def augment_scores(items):
+    out = {}
+    for m in items:
+        if not m.get('thumb') or time.time() > HARD['t']:
+            continue
+        live_poll()
+        try:
+            r = sess.get(m['thumb'], timeout=20)
+            im = Image.open(io.BytesIO(r.content)).convert('RGBA')
+            mask, _ = _mask_rgb(im)
+            im.putalpha(Image.fromarray((mask * 255).astype(np.uint8)))
+        except Exception:
+            continue
+        for name, f in AUG.items():
+            try:
+                b = io.BytesIO()
+                f(im).save(b, 'PNG')
+                fa = features(b.getvalue())
+                if fa:
+                    out.setdefault(name, []).append(float(visual_score(finish(fa), m['feat'])[0]))
+            except Exception:
+                pass
+    return out
+
+def history(db):
+    try:
+        conf = [r[0] for r in db.execute("select visual from checked where ai like 'same%' or ai like 'remake%' or verdict like 'Likely COPY%'")]
+        unrel = [r[0] for r in db.execute("select visual from checked where ai like 'unrelated%'")]
+    except sqlite3.OperationalError:
+        return
+    L = {'confirmed': len(conf), 'unrelated': len(unrel), 'checked': db.execute('select count(*) from checked').fetchone()[0]}
+    if len(conf) >= 5:
+        lo = float(np.percentile(conf, 10))
+        L.update(confirmed_lo=lo, scan_min_visual=float(min(0.5, max(0.35, lo - 0.05))), ai_min_visual=float(min(0.45, max(0.35, lo - 0.05))))
+    if unrel:
+        L['unrelated_hi'] = float(np.percentile(unrel, 95))
+    kv_set(db, 'learn', L)
+
+def learned(db, cfg):
+    cal, L = (kv_get(db, 'calib', {}), kv_get(db, 'learn', {}))
     if cal.get('copy'):
-        cfg['copy_threshold'] = cal['copy']
+        cfg['copy_threshold'] = min(cfg['copy_threshold'], cal['copy'])
     if cal.get('vox_copy'):
         cfg['vox_copy'] = cal['vox_copy']
+    for k in ('scan_min_visual', 'ai_min_visual'):
+        if L.get(k):
+            cfg[k] = min(cfg.get(k, 0.5), L[k])
 
 def selftest(db, cfg):
     if not load_mine(db):
@@ -1328,7 +1428,7 @@ TAXONOMY = {8: 'thukPQUFe5EHxRrtsgq43u', 43: 'tvckLAbtDAGwF9Y2sph2Ce', 44: '8i1s
 TYPE_WORDS = {8: 'horns horn hat crown halo ears demon devil dragon helmet hood mask bow'.split(), 46: 'wings wing sword cape bag backpack angel demon dragon chain cross bow'.split(), 47: 'tail tails fluffy fox wolf cat kitsune bunny dragon demon devil furry plush chain belt bow'.split(), 45: 'fan sword chain plush bag'.split(), 43: 'chain choker necklace collar'.split(), 44: 'plush pet'.split()}
 PRICE_BANDS = [(0, 64), (65, 65), (66, 75), (76, 90), (91, 110), (111, 150), (151, 250), (251, 600), (601, 10 ** 7)]
 
-def scan_slices(mine):
+def scan_slices(mine, offenders=()):
     by_type = {}
     for m in mine:
         by_type.setdefault(m['atype'], []).append(m)
@@ -1344,6 +1444,12 @@ def scan_slices(mine):
         for w in sorted(words):
             for lo, hi in PRICE_BANDS:
                 out.append({'taxonomy': tax, 'Keyword': w, 'SortType': 0, 'MinPrice': lo, 'MaxPrice': hi})
+    for kw in sorted(keywords(mine)):
+        for sort in (0, 3):
+            out.append({'Keyword': kw, 'SortType': sort})
+    for nm in offenders:
+        for sort in (3, 2):
+            out.append({'CreatorName': nm, 'SortType': sort})
     return out
 
 def scan_shard(db, cfg, shard, total, minutes=24):
@@ -1354,7 +1460,12 @@ def scan_shard(db, cfg, shard, total, minutes=24):
         return
     stop = time.time() + minutes * 60
     HARD['t'] = stop + 6 * 60
-    slices = scan_slices(mine)[shard::total]
+    try:
+        offenders = [r[0] for r in db.execute("select distinct creator from checked where verdict<>''")]
+    except sqlite3.OperationalError:
+        offenders = []
+    learned(db, cfg)
+    slices = scan_slices(mine, offenders)[shard::total]
     skip = set(cfg['ignore_creator_ids']) | {cfg['my_creator_id']}
     found, done = ({}, 0)
     for sl in slices:
@@ -1387,7 +1498,7 @@ def scan_shard(db, cfg, shard, total, minutes=24):
     out = HERE / 'scan'
     out.mkdir(exist_ok=True)
     name = f"{os.environ.get('GITHUB_RUN_ID', int(time.time()))}-{shard}.json.gz"
-    stats = {'slices': done, 'of': len(slices), 'found': len(found), 'compared': scored, 'handed': len(keep)}
+    stats = {'slices': done, 'of': len(slices), 'found': len(found), 'compared': scored, 'handed': len(keep), 'total': total}
     (out / name).write_bytes(gzip.compress(json.dumps({'stats': stats, 'items': keep}).encode()))
     log(f'compared {scored} items by picture, {len(keep)} look-alikes handed to the watcher')
 
@@ -1402,9 +1513,10 @@ def ingest_scans(db):
             tot = kv_get(db, 'scan_stats', {})
             run = f.name.split('-')[0]
             if tot.get('run') != run:
-                tot = {'run': run, 'at': time.time(), 'found': 0, 'compared': 0, 'handed': 0, 'files': 0, 'seen': []}
+                tot = {'run': run, 'at': time.time(), 'found': 0, 'compared': 0, 'handed': 0, 'files': 0, 'seen': [], 'slices': 0, 'of': 0}
             if f.name not in tot.setdefault('seen', []):
-                for k in ('found', 'compared', 'handed'):
+                tot['total'] = st.get('total', tot.get('total', 10))
+                for k in ('found', 'compared', 'handed', 'slices', 'of'):
                     tot[k] = tot.get(k, 0) + st.get(k, 0)
                 tot['files'] = tot.get('files', 0) + 1
                 tot['seen'].append(f.name)
@@ -1430,8 +1542,9 @@ def _cycle(db, cfg):
         log('no items of yours indexed yet; check my_creator_id')
         return
     types = {m['atype'] for m in mine} | set(cfg['extra_asset_types'])
+    cfg.update(ai_max_calls_per_day=10 ** 9, max_alerts_per_cycle=10 ** 9)
     budget = cfg['max_alerts_per_cycle']
-    deadline = time.time() + cfg['max_run_minutes'] * 60
+    deadline = HARD['t']
     LIVE.update(ctx=(db, cfg, mine, types), last=0, busy=False)
     live_poll(catch_up=True)
     if cfg.get('roblox_cookie') and (not kv_get(db, 'mymesh_full')):
@@ -1440,7 +1553,7 @@ def _cycle(db, cfg):
             kv_set(db, 'mymesh_full', 1)
     calibrate(db, cfg, mine)
     if ai_ready(cfg, db):
-        ids = [r[0] for r in db.execute('select id from later limit ?', (int(os.environ.get('DEEP_PER_RUN', 150)),))]
+        ids = [r[0] for r in db.execute('select id from later limit ?', (int(os.environ.get('DEEP_PER_RUN', 10 ** 9)),))]
         if ids:
             q = ','.join(map(str, ids))
             db.execute(f'delete from later where id in ({q})')
@@ -1454,7 +1567,7 @@ def _cycle(db, cfg):
             db.commit()
             log(f'looked again at {len(ids)} items that were waiting for an AI review')
     ingest_scans(db)
-    rows = db.execute('select id, raw from deep order by score desc limit ?', (int(os.environ.get('DEEP_PER_RUN', 150)),)).fetchall()
+    rows = db.execute('select id, raw from deep order by score desc limit ?', (int(os.environ.get('DEEP_PER_RUN', 10 ** 9)),)).fetchall()
     if rows and time.time() < deadline:
         ids = [r[0] for r in rows]
         db.execute(f"delete from deep where id in ({','.join(map(str, ids))})")
@@ -1465,84 +1578,74 @@ def _cycle(db, cfg):
             db.execute('insert or ignore into deep values(?,?,?)', (i, json.loads(raw).get('_score', 0), raw))
         db.commit()
         log(f"catalog scanner: checked {len(rows) - len(back)} look-alikes, {db.execute('select count(*) from deep').fetchone()[0]} still queued")
-    if time.time() - kv_get(db, 'sweep_at', 0) > cfg['sweep_hours'] * 3600:
-        kws = list(keywords(mine).items())
-        pos = kv_get(db, 'sweep_pos', 0)
-        while pos < len(kws):
-            if time.time() > deadline:
-                log(f'out of time, scan continues next run ({pos}/{len(kws)} search terms done)')
-                kv_set(db, 'sweep_pos', pos)
-                return
-            kw, since = kws[pos]
-            n = 0
-            for page in search_wide(CATALOG.replace('/v1/', '/v2/'), cfg.get('sweep_wide_pages', 5), Keyword=kw, Category=11, SortType=0, salesTypeFilter=1):
-                page = [d for d in page if (d.get('itemCreatedUtc') or '9') >= since]
-                n += len(page)
-                budget -= process(db, cfg, mine, page, types, budget, 'scan')
-            log(f"  scan '{kw}': {n} items uploaded since {since[:10]}")
-            pos += 1
-            kv_set(db, 'sweep_pos', pos)
-        kv_set(db, 'sweep_pos', 0)
-        kv_set(db, 'sweep_at', time.time())
-    if time.time() - kv_get(db, 'stores_at', 0) > 24 * 3600 and time.time() < deadline:
-        names = [r[0] for r in db.execute("select creator, max(visual) v from checked where verdict<>'' group by creator order by v desc limit 15")]
-        for nm in names:
-            for page in search_wide(CATALOG.replace('/details', ''), 3, Category=11, SortType=3, CreatorName=nm):
-                new = [d['id'] for d in page if d.get('itemType') == 'Asset' and (not is_seen(db, d['id']))]
-                items = details_batch(new)
-                for i in set(new) - {d['id'] for d in items}:
-                    mark(db, i)
-                budget -= process(db, cfg, mine, items, {8, 41, 42, 43, 44, 45, 46, 47}, budget, 'scan')
-        log(f'checked the stores of {len(names)} flagged creators')
-        kv_set(db, 'stores_at', time.time())
 
 def live_poll(catch_up=False):
     if LIVE['busy'] or not LIVE.get('ctx'):
         return
     db, cfg, mine, types = LIVE['ctx']
-    if not catch_up and time.time() - LIVE['last'] < cfg.get('live_poll_seconds', 20):
+    if not catch_up and time.time() - LIVE['last'] < cfg.get('live_poll_seconds', 15):
         return
     LIVE['busy'] = True
+    waited0 = STATS['waited']
     try:
         db.execute('create table if not exists fed(id integer primary key, at real)')
+        db.execute('create table if not exists feedwait(id integer primary key, at real)')
         first = not kv_get(db, 'feed_since')
         if first:
             kv_set(db, 'feed_since', time.time())
         cut = time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(time.time() - cfg.get('feed_max_age_days', 3) * 86400))
         got = posted = 0
-        pages = cfg.get('feed_catch_up_pages', 25) if catch_up or first else cfg.get('feed_live_pages', 8)
-        for page in search_wide(CATALOG.replace('/details', ''), pages, Category=1, SortType=3, salesTypeFilter=1):
-            new = [d['id'] for d in page if d.get('itemType') == 'Asset' and (not db.execute('select 1 from fed where id=?', (d['id'],)).fetchone())]
-            if not new:
-                break
-            got += len(new)
-            if first:
-                db.executemany('insert or ignore into fed values(?,?)', [(i, time.time()) for i in new])
-                continue
-            items = details_batch(new)
-            for i in set(new) - {d['id'] for d in items}:
-                db.execute('insert or ignore into fed values(?,?)', (i, time.time()))
-            show = []
-            for d in items:
-                limited = set(d.get('itemRestrictions') or []) & {'Collectible', 'Limited', 'LimitedUnique'}
-                if limited or d.get('creatorTargetId') == 1 or (d.get('itemCreatedUtc') or '')[:19] < cut:
-                    db.execute('insert or ignore into fed values(?,?)', (d['id'], time.time()))
-                else:
-                    show.append(d)
-            show.sort(key=lambda d: d.get('itemCreatedUtc') or '')
-            for d in show:
-                process(db, cfg, mine, [d], ACCESSORY | types, cfg.get('max_alerts_per_cycle', 40))
-                posted += feed_cards(db, cfg, [d])
-            flush_feed(cfg)
-            db.commit()
+        pages = cfg.get('feed_catch_up_pages', 60) if catch_up or first else cfg.get('feed_live_pages', 10)
+        url = CATALOG.replace('/v1/', '/v2/')
+        recheck = [r[0] for r in db.execute('select id from feedwait where at<? order by at limit 300', (time.time() - cfg.get('feed_recheck_seconds', 240),))]
+        for params in ({'IncludeNotForSale': 'true'}, {'salesTypeFilter': 1}):
+            for page in search_wide(url, pages, Category=1, SortType=3, **params):
+                page = [d for d in page if d.get('itemType') == 'Asset']
+                new = [d for d in page if not db.execute('select 1 from fed where id=?', (d['id'],)).fetchone() and (not db.execute('select 1 from feedwait where id=?', (d['id'],)).fetchone())]
+                if not new:
+                    break
+                got += len(new)
+                if first:
+                    db.executemany('insert or ignore into fed values(?,?)', [(d['id'], time.time()) for d in new])
+                    continue
+                posted += feed_items(db, cfg, mine, types, new, cut)
+                db.commit()
+        if recheck and (not first):
+            db.executemany('update feedwait set at=? where id=?', [(time.time(), i) for i in recheck])
+            items = details_batch(recheck)
+            for i in set(recheck) - {d['id'] for d in items}:
+                db.execute('delete from feedwait where id=?', (i,))
+            posted += feed_items(db, cfg, mine, types, items, cut, recheck=True)
+        flush_feed(cfg)
         db.commit()
-        if got:
-            log(f'feed: {got} new listings, {posted} posted')
+        waited = STATS['waited'] - waited0
+        if got or waited:
+            log(f'feed: {got} new listings, {posted} posted, waited {round(waited)} s for Roblox')
     except Exception as e:
         log('live feed error:', repr(e)[:160])
     finally:
         LIVE['busy'] = False
         LIVE['last'] = time.time()
+
+def feed_items(db, cfg, mine, types, items, cut, recheck=False):
+    show = []
+    for d in items:
+        limited = set(d.get('itemRestrictions') or []) & {'Collectible', 'Limited', 'LimitedUnique'}
+        if limited or d.get('creatorTargetId') == 1 or (d.get('itemCreatedUtc') or '')[:19] < cut:
+            db.execute('insert or ignore into fed values(?,?)', (d['id'], time.time()))
+            db.execute('delete from feedwait where id=?', (d['id'],))
+        elif d.get('price') is None and d.get('lowestPrice') is None:
+            if not recheck:
+                db.execute('insert or ignore into feedwait values(?,?)', (d['id'], time.time()))
+        else:
+            db.execute('delete from feedwait where id=?', (d['id'],))
+            show.append(d)
+    show.sort(key=lambda d: d.get('itemCreatedUtc') or '')
+    n = 0
+    for d in show:
+        process(db, cfg, mine, [d], ACCESSORY | types, cfg.get('max_alerts_per_cycle', 10 ** 9))
+        n += feed_cards(db, cfg, [d])
+    return n
 ASSET_KIND = {8: 'Hat', 41: 'Hair Accessory', 42: 'Face Accessory', 43: 'Neck Accessory', 44: 'Shoulder Accessory', 45: 'Front Accessory', 46: 'Back Accessory', 47: 'Waist Accessory', 61: 'Emote', 64: 'T-Shirt Accessory', 65: 'Shirt Accessory', 66: 'Pants Accessory', 67: 'Jacket Accessory', 68: 'Sweater Accessory', 69: 'Shorts Accessory', 70: 'Left Shoe Accessory', 71: 'Right Shoe Accessory', 72: 'Dress Skirt Accessory', 76: 'Eyebrow Accessory', 77: 'Eyelash Accessory', 78: 'Mood Animation', 79: 'Dynamic Head', 92: 'Avatar Background'}
 
 def feed_cards(db, cfg, items):
@@ -1554,8 +1657,10 @@ def feed_cards(db, cfg, items):
     for d in items:
         u = pics.get(d['id'])
         if u in ('Pending', 'InReview', None) and d['id'] not in info:
+            db.execute('insert or ignore into feedwait values(?,?)', (d['id'], time.time()))
             continue
         db.execute('insert or ignore into fed values(?,?)', (d['id'], time.time()))
+        db.execute('delete from feedwait where id=?', (d['id'],))
         c = to_cand(d)
         link = f"https://www.roblox.com/catalog/{c['id']}"
         e = info.get(c['id'])
