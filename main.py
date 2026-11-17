@@ -1811,6 +1811,7 @@ def live_poll(catch_up=False):
     try:
         db.execute('create table if not exists fed(id integer primary key, at real)')
         db.execute('create table if not exists feedwait(id integer primary key, at real)')
+        db.execute('create table if not exists feedpic(id integer primary key)')
         first = not kv_get(db, 'feed_since')
         if catch_up and (not first) and (not kv_get(db, 'feedwait_v2')):
             clear_backlog(db)
@@ -1831,7 +1832,7 @@ def live_poll(catch_up=False):
             for page in search_wide(url, pages, Category=1, SortType=3, **quick, **params):
                 page = [d for d in page if d.get('itemType') == 'Asset']
                 on_sale = lambda d: d.get('price') is not None or d.get('lowestPrice') is not None
-                new = [d for d in page if not db.execute('select 1 from fed where id=?', (d['id'],)).fetchone() and (on_sale(d) or not db.execute('select 1 from feedwait where id=?', (d['id'],)).fetchone())]
+                new = [d for d in page if not db.execute('select 1 from fed where id=?', (d['id'],)).fetchone() and (not db.execute('select 1 from feedpic where id=?', (d['id'],)).fetchone()) and (on_sale(d) or not db.execute('select 1 from feedwait where id=?', (d['id'],)).fetchone())]
                 if not new:
                     break
                 got += len(new)
@@ -1905,9 +1906,11 @@ def feed_cards(db, cfg, items):
         u = pics.get(d['id'])
         if u in ('Pending', 'InReview', None) and d['id'] not in info:
             db.execute('insert or ignore into feedwait values(?,?)', (d['id'], time.time()))
+            db.execute('insert or ignore into feedpic values(?)', (d['id'],))
             continue
         db.execute('insert or ignore into fed values(?,?)', (d['id'], time.time()))
         db.execute('delete from feedwait where id=?', (d['id'],))
+        db.execute('delete from feedpic where id=?', (d['id'],))
         c = to_cand(d)
         link = f"https://www.roblox.com/catalog/{c['id']}"
         e = info.get(c['id'])
