@@ -20,6 +20,12 @@ jobs:
       PUBLIC_LOG: "1"
       RUN_MINUTES: "25"
       DEEP_PER_RUN: "5000"
+      DATA_REPO: ${{ secrets.DATA_REPO }}
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+      FEED_WEBHOOK_URL: ${{ secrets.FEED_WEBHOOK_URL }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      ROBLOX_COOKIE: ${{ secrets.ROBLOX_COOKIE }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
@@ -32,9 +38,6 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -q -r requirements.txt
-      - env:
-          S: ${{ toJSON(secrets) }}
-        run: echo "$S" | jq -r 'to_entries[] | select(.key != "github_token") | "\(.key)=\(.value)"' >> "$GITHUB_ENV"
       - run: python main.py --once --data data
       - if: always()
         working-directory: data
