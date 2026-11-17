@@ -1,4 +1,4 @@
-import argparse, base64, calendar, difflib, gzip, hashlib, io, json, os, pathlib, re, sqlite3, struct, sys, time
+import argparse, base64, calendar, difflib, gzip, hashlib, io, itertools, json, os, pathlib, re, sqlite3, struct, sys, time
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import requests
@@ -9,11 +9,11 @@ THUMBS = 'https://thumbnails.roblox.com/v1/assets'
 SUBCAT = {46: 25, 47: 26}
 COLOURS = set('black white grey gray red blue pink purple violet green yellow orange brown\nlight dark pastel neon gold golden silver cyan teal lavender beige cream blonde ginger\nombre rainbow and'.split())
 STOP = set('the a an of for with to in on my your our is it its this that very'.split())
-DEFAULTS = {'discord_webhook_url': '', 'my_creator_id': 0, 'my_creator_type': 'Group', 'ignore_creator_ids': [], 'extra_asset_types': [], 'poll_minutes': 5, 'feed_pages': 6, 'sweep_hours': 12, 'sweep_pages': 15, 'refresh_my_items_hours': 6, 'copy_threshold': 0.8, 'remake_threshold': 0.63, 'combo_threshold': 0.5, 'ai_provider': 'auto', 'anthropic_api_key': '', 'gemini_api_key': '', 'anthropic_workspace_id': '', 'anthropic_model': 'claude-haiku-5-5', 'gemini_model': 'gemini-3.5-flash', 'ai_min_visual': 0.45, 'ai_max_calls_per_day': 300, 'text_alerts': True, 'max_alerts_per_cycle': 15, 'status_updates': 'every_run', 'max_run_minutes': 12}
+DEFAULTS = {'discord_webhook_url': '', 'my_creator_id': 0, 'my_creator_type': 'Group', 'ignore_creator_ids': [], 'extra_asset_types': [], 'poll_minutes': 5, 'feed_pages': 6, 'sweep_hours': 12, 'sweep_pages': 15, 'refresh_my_items_hours': 6, 'copy_threshold': 0.8, 'remake_threshold': 0.63, 'combo_threshold': 0.5, 'ai_provider': 'auto', 'anthropic_api_key': '', 'gemini_api_key': '', 'anthropic_workspace_id': '', 'anthropic_model': 'claude-haiku-5-5', 'gemini_model': 'gemini-3.5-flash', 'ai_min_visual': 0.45, 'ai_max_calls_per_day': 300, 'text_alerts': True, 'max_alerts_per_cycle': 40, 'status_updates': 'every_run', 'max_run_minutes': 12}
 sess = requests.Session()
 sess.headers['User-Agent'] = 'Mozilla/5.0 (ugc-watch; personal IP monitoring)'
 AI_DOWN = set()
-STATS = {'checked': 0, 'alerts': 0, 'ai_ok': 0, 'ai_failed': 0, 'waited': 0.0, 'note': '', 'mesh': 0, 'mesh_fail': 0}
+STATS = {'checked': 0, 'alerts': 0, 'ai_ok': 0, 'ai_failed': 0, 'waited': 0.0, 'note': '', 'mesh': 0, 'mesh_fail': 0, 'live': 0}
 QUIET = {'on': False}
 
 def log(*a):
@@ -141,12 +141,14 @@ def name_score(a, b):
     return max(jac, difflib.SequenceMatcher(None, ' '.join(ta), ' '.join(tb)).ratio())
 
 def desc_score(mine, theirs):
-    a, b = (' '.join(tokens(mine, False)), ' '.join(tokens(theirs, False)))
-    if len(a) < 20 or len(b) < 20:
+    a, b = (tokens(mine, False), tokens(theirs, False))
+    if len(a) < 4 or len(b) < 4:
         return 0.0
-    sm = difflib.SequenceMatcher(None, a, b, autojunk=False)
-    covered = sum((blk.size for blk in sm.get_matching_blocks() if blk.size >= 12))
-    return min(1.0, covered / len(a))
+    if len(a) < 6:
+        return 1.0 if f" {' '.join(a)} " in f" {' '.join(b)} " else 0.0
+    grams = lambda t: {tuple(t[k:k + 3]) for k in range(len(t) - 2)}
+    ga = grams(a)
+    return min(1.0, len(ga & grams(b)) / len(ga))
 
 def handles(s):
     return set(re.findall('@\\w{3,}', s or ''))
@@ -484,54 +486,59 @@ def fld(n, v):
     return {'name': n, 'value': str(v), 'inline': True}
 
 def alert(cfg, cand, res):
-    PENDING.setdefault('all', []).append((cand, res))
-    return True
+    return send_alert(cfg, cand, res)
 
 def flush_alerts(cfg):
+    pass
+TIER_NAMES = {'strong': 'strong takedown case', 'possible': 'possible takedown case', 'remake': 'possible remake', 'text': 'copied listing text', 'similar': 'similar look and name', 'copy': 'likely copy'}
+
+def send_alert(cfg, cand, res):
     day = when
-    for cand, res in sorted(PENDING.get('all', []), key=lambda x: (tier(x[1]['verdict']), -x[1]['visual'])):
-        m = res['match']
-        level, text = takedown(cand, res, m)
-        key = 'strong' if level.startswith('Strong') else 'possible' if text else RANK[min(tier(res['verdict']), 3)][1]
-        TIERS[key] = TIERS.get(key, 0) + 1
-        link = f"https://www.roblox.com/catalog/{cand['id']}"
-        why = []
-        if res.get('mesh'):
-            if res['mesh'] >= 0.5:
-                why.append('3D model is the same as yours' if res['mesh'] >= 1.0 else f"3D shape {res['mesh']:.0%} the same as yours")
-        m3 = res.get('m3d') or {}
-        if m3.get('counts') and (not m3.get('same_mesh')):
-            why.append('Same vertex and face count as your mesh')
-        if m3.get('inner'):
-            why.append(f'''Their file is still named "{m3['inner'][0][:60]}", same as yours''')
-        if AI_MESH.search((m3.get('theirs') or {}).get('mesh_name') or ''):
-            why.append('Their mesh name looks like an AI 3D-generator export')
-        if res.get('render') is not None:
-            why.append(f"Bare mesh without texture looks {pct(res['render']):.0%} like yours")
-        if res.get('tex'):
-            why.append('Uses the same texture image as yours')
-        elif (res.get('texsim') or 0) >= 0.6:
-            why.append(f"Texture image {res['texsim']:.0%} the same as yours")
-        if res.get('mesh_info'):
-            why.append('Their mesh: ' + res['mesh_info'])
-        if res['credit']:
-            why.append('Uses your credit ' + ', '.join(res['credit']))
-        elif res['desc'] >= 0.5:
-            why.append(f"Description {res['desc']:.0%} the same as yours")
-        if res['ai']:
-            why.append(res['ai']['reason'][:400])
-        main = {'author': {'name': 'UGC Watch'}, 'title': cand['name'][:250], 'url': link, 'color': res['colour'], 'description': f"**{label(res['verdict'])}**\n{KIND.get(cand.get('atype'), 'Accessory')} · [Roblox Page]({link})" + ('\n\n' + '\n'.join(why) if why else ''), 'fields': [fld('Creator', who(cand)), fld('Price', cost(cand)), fld('Uploaded', day(cand['created'])), fld('Looks like yours', f"{pct(res['visual']):.0%}"), fld('Takedown', level.split(':')[0])], 'footer': {'text': 'Detected'}, 'timestamp': stamp()}
-        mine = {'author': {'name': 'Your original'}, 'title': m['name'][:250], 'color': 2829617, 'url': f"https://www.roblox.com/catalog/{m['id']}", 'description': f"Uploaded {day(m['created'])}"}
-        if cand.get('thumb'):
-            main['thumbnail'] = {'url': cand['thumb']}
-        if m.get('thumb'):
-            mine['thumbnail'] = {'url': m['thumb']}
-        embeds = [main, mine] + (mesh_cards(res['m3d'], res['colour']) if res.get('m3d') else [])
-        if text:
-            embeds.append({'author': {'name': 'Takedown request text'}, 'color': res['colour'], 'description': '```\n' + text[:3800] + '\n```', 'footer': {'text': 'Draft. Check every line is true before sending it to Roblox.'}})
-        if send(cfg, {'username': 'UGC Watch', 'embeds': embeds}):
-            STATS['alerts'] += 1
-        time.sleep(0.8)
+    m = res['match']
+    level, text = takedown(cand, res, m)
+    key = 'strong' if level.startswith('Strong') else 'possible' if text else RANK[min(tier(res['verdict']), 3)][1]
+    TIERS[key] = TIERS.get(key, 0) + 1
+    PENDING.setdefault('found', []).append((key, cand['id'], cand['name'], cand['creator']))
+    link = f"https://www.roblox.com/catalog/{cand['id']}"
+    why = []
+    if res.get('mesh'):
+        if res['mesh'] >= 0.5:
+            why.append('3D model is the same as yours' if res['mesh'] >= 1.0 else f"3D shape {res['mesh']:.0%} the same as yours")
+    m3 = res.get('m3d') or {}
+    if m3.get('counts') and (not m3.get('same_mesh')):
+        why.append('Same vertex and face count as your mesh')
+    if m3.get('inner'):
+        why.append(f'''Their file is still named "{m3['inner'][0][:60]}", same as yours''')
+    if AI_MESH.search((m3.get('theirs') or {}).get('mesh_name') or ''):
+        why.append('Their mesh name looks like an AI 3D-generator export')
+    if res.get('render') is not None:
+        why.append(f"Bare mesh without texture looks {pct(res['render']):.0%} like yours")
+    if res.get('tex'):
+        why.append('Uses the same texture image as yours')
+    elif (res.get('texsim') or 0) >= 0.6:
+        why.append(f"Texture image {res['texsim']:.0%} the same as yours")
+    if res.get('mesh_info'):
+        why.append('Their mesh: ' + res['mesh_info'])
+    if res['credit']:
+        why.append('Uses your credit ' + ', '.join(res['credit']))
+    elif res['desc'] >= 0.5:
+        why.append(f"Description {res['desc']:.0%} the same as yours")
+    if res['ai']:
+        why.append(res['ai']['reason'][:400])
+    main = {'author': {'name': 'UGC Watch'}, 'title': cand['name'][:250], 'url': link, 'color': res['colour'], 'description': f"**{label(res['verdict'])}**\n{KIND.get(cand.get('atype'), 'Accessory')} · [Roblox Page]({link})" + ('\n\n' + '\n'.join(why) if why else ''), 'fields': [fld('Creator', who(cand)), fld('Price', cost(cand)), fld('Uploaded', day(cand['created'])), fld('Looks like yours', f"{pct(res['visual']):.0%}"), fld('Takedown', level.split(':')[0])], 'footer': {'text': 'Detected'}, 'timestamp': stamp()}
+    mine = {'author': {'name': 'Your original'}, 'title': m['name'][:250], 'color': 2829617, 'url': f"https://www.roblox.com/catalog/{m['id']}", 'description': f"Uploaded {day(m['created'])}"}
+    if cand.get('thumb'):
+        main['thumbnail'] = {'url': cand['thumb']}
+    if m.get('thumb'):
+        mine['thumbnail'] = {'url': m['thumb']}
+    embeds = [main, mine] + (mesh_cards(res['m3d'], res['colour']) if res.get('m3d') else [])
+    if text:
+        embeds.append({'author': {'name': 'Takedown request text'}, 'color': res['colour'], 'description': '```\n' + text[:3800] + '\n```', 'footer': {'text': 'Draft. Check every line is true before sending it to Roblox.'}})
+    ok = send(cfg, {'username': 'UGC Watch', 'embeds': embeds})
+    if ok:
+        STATS['alerts'] += 1
+    time.sleep(0.8)
+    return ok
 
 def to_cand(d):
     return {'id': d['id'], 'name': d.get('name') or '', 'descr': d.get('description') or '', 'created': d.get('itemCreatedUtc') or '', 'atype': d.get('assetType'), 'creator': d.get('creatorName') or '?', 'cid': d.get('creatorTargetId'), 'ctype': d.get('creatorType') or 'User', 'price': d.get('price')}
@@ -726,7 +733,8 @@ def _vox(v):
     _, axes = np.linalg.eigh(c.T @ c)
     p = c @ axes[:, ::-1]
     p *= np.where((p ** 3).mean(0) < 0, -1.0, 1.0)
-    p /= np.abs(p).max() + 1e-09
+    p /= np.percentile(np.abs(p), 99.5, axis=0).max() + 1e-09
+    p = np.clip(p, -1, 1)
     g = np.zeros((VG, VG, VG), bool)
     ix = np.clip(((p + 1) / 2 * (VG - 1)).round().astype(int), 0, VG - 1)
     g[ix[:, 0], ix[:, 1], ix[:, 2]] = True
@@ -747,10 +755,30 @@ def vox_score(a, b):
     ga, gb = (_grid(a), _grid(b))
     da, na = (_thick(ga), max(1, ga.sum()))
     strict = slack = 0.0
-    for f in range(8):
-        h = gb[::-1 if f & 1 else 1, ::-1 if f & 2 else 1, ::-1 if f & 4 else 1]
-        strict = max(strict, (ga & h).sum() / max(1, (ga | h).sum()))
-        slack = max(slack, min((ga & _thick(h)).sum() / na, (h & da).sum() / max(1, h.sum())))
+    tries = []
+    for perm in itertools.permutations(range(3)):
+        gp = gb.transpose(perm)
+        for f in range(8):
+            h = gp[::-1 if f & 1 else 1, ::-1 if f & 2 else 1, ::-1 if f & 4 else 1]
+            iou = (ga & h).sum() / max(1, (ga | h).sum())
+            tries.append((iou, h))
+            strict = max(strict, iou)
+            slack = max(slack, min((ga & _thick(h)).sum() / na, (h & da).sum() / max(1, h.sum())))
+    for _, h in sorted(tries, key=lambda t: -t[0])[:3]:
+        pts = np.argwhere(h).astype(np.float64) - (VG - 1) / 2
+        for ax in range(3):
+            i, j = [k for k in range(3) if k != ax]
+            for deg in range(-40, 41, 8):
+                if not deg:
+                    continue
+                c, sn = (np.cos(np.radians(deg)), np.sin(np.radians(deg)))
+                q = pts.copy()
+                q[:, i], q[:, j] = (c * pts[:, i] - sn * pts[:, j], sn * pts[:, i] + c * pts[:, j])
+                ix = np.clip((q + (VG - 1) / 2).round().astype(int), 0, VG - 1)
+                g = np.zeros_like(ga)
+                g[ix[:, 0], ix[:, 1], ix[:, 2]] = True
+                strict = max(strict, (ga & g).sum() / max(1, (ga | g).sum()))
+                slack = max(slack, min((ga & _thick(g)).sum() / na, (g & da).sum() / max(1, g.sum())))
     return (float(strict), float(slack))
 STD_NAMES = {'handle', 'mesh', 'thumbnailconfiguration', 'thumbnailcameratarget', 'thumbnailcameravalue', 'avatarpartscaletype', 'originalsize', 'surfaceappearance', 'wraplayer', 'accessory', 'specialmesh', 'meshpart', 'weld', 'accessoryweld', 'rigidconstraint'}
 
@@ -834,6 +862,10 @@ def mesh_desc(asset_id, cfg, previews=True):
                     g = np.asarray(Image.open(io.BytesIO(tb)).convert('L').resize((32, 32)), np.float32)
                     if g.std() >= 4:
                         out['texv'] = (g - g.mean()) / g.std()
+                        g2 = np.asarray(Image.open(io.BytesIO(tb)).convert('L').resize((64, 64)), np.float32)
+                        e = np.hypot(*np.gradient(g2))
+                        if e.std() > 0:
+                            out['texe'] = (e - e.mean()) / e.std()
                 except Exception:
                     pass
             try:
@@ -918,7 +950,10 @@ def render_score(a, b):
 def texture_score(a, b):
     if a.get('texv') is None or b.get('texv') is None:
         return None
-    return float(max(0.0, (a['texv'] * b['texv']).mean()))
+    s = float(max(0.0, (a['texv'] * b['texv']).mean()))
+    if a.get('texe') is not None and b.get('texe') is not None:
+        s = max(s, float((a['texe'] * b['texe']).mean()))
+    return s
 
 def same_texture(a, b):
     return bool(a.get('tex_id') and a.get('tex_id') == b.get('tex_id') or (a.get('tex_sha') and a.get('tex_sha') == b.get('tex_sha')))
@@ -938,7 +973,11 @@ def my_models(db, cfg, mine):
     import pickle
     db.execute('create table if not exists mymesh(id integer primary key, at real, blob blob)')
     have = {r[0]: r[1] for r in db.execute('select id, blob from mymesh')}
-    todo = [m for m in mine if m['id'] not in have][:12]
+    if not kv_get(db, 'mymesh_v3'):
+        db.execute('delete from mymesh')
+        kv_set(db, 'mymesh_v3', 1)
+        have = {}
+    todo = [m for m in mine if m['id'] not in have][:40]
     for m in todo:
         if time.time() > HARD['t']:
             break
@@ -959,6 +998,9 @@ def decide(db, cfg, mine, cand, feat, raw_png, left, src='new'):
         db.execute('insert or ignore into later values(?)', (cand['id'],))
         mark(db, cand['id'])
         db.commit()
+        if src == 'new':
+            near = res['visual_match'] or res['match']
+            ACTIVITY.append((src, cand, res['visual'], near['name'] if near else '', False))
         return 0
     if wants and ai_provider(cfg) and (left > 0):
         vm = res['visual_match']
@@ -1011,6 +1053,8 @@ def decide(db, cfg, mine, cand, feat, raw_png, left, src='new'):
                 res.update(verdict=level[0], colour=level[1], confidence=max(res['confidence'], level[2]), match=mm)
             elif res['verdict'] and res['verdict'].startswith('Possible REMAKE') and ((vox or 0) < 0.3) and (r is not None) and (r < 0.45) and (res['visual'] < 0.45):
                 res.update(verdict='Similar look and name (3D model differs from yours)', colour=3447003)
+    if res and res['verdict'] and res['verdict'].startswith('Listing text') and (not res['credit']) and (res['desc'] < 0.75) and (res['ai'] and res['ai']['relation'] == 'unrelated' or (res.get('render') is not None and res['render'] < 0.3)):
+        res['verdict'] = None
     hit = bool(res and res['verdict'])
     if hit and cand.get('cid') in cfg.get('low_priority_creator_ids', []) and (tier(res['verdict']) > 0):
         hit = False
@@ -1049,6 +1093,8 @@ def process(db, cfg, mine, raw, types, budget, src='new'):
     for cid, cand in fresh.items():
         if time.time() > HARD['t']:
             break
+        if src != 'new':
+            live_poll()
         u = urls.get(cid)
         if u in ('Pending', 'InReview', None):
             continue
@@ -1081,8 +1127,10 @@ def cycle(db, cfg):
     PENDING.clear()
     TIERS.clear()
     started = time.time()
+    LIVE.update(ctx=None, last=0, busy=False)
     try:
         _cycle(db, cfg)
+        live_until_end()
     finally:
         flush_alerts(cfg)
         write_report(db)
@@ -1121,26 +1169,24 @@ def mesh_cards(m, colour=5793266):
     return [theirs, yours]
 
 def post_activity(cfg):
+    post_feed(cfg)
+
+def post_feed(cfg):
     url = cfg.get('feed_webhook_url')
-    if not url or not ACTIVITY:
+    fresh = [e for e in ACTIVITY if e[0] == 'new']
+    ACTIVITY[:] = [e for e in ACTIVITY if e[0] != 'new']
+    if not url or not fresh:
         return
-    ev = sorted(ACTIVITY, key=lambda e: (not e[4], -e[2]))
-    cap = cfg.get('feed_max_cards', 120)
-    cards, solo = ([], [])
-    for src, c, v, mname, hit in ev[:cap]:
+    cut = time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(time.time() - cfg.get('feed_max_age_hours', 6) * 3600))
+    fresh = sorted((e for e in fresh if (e[1].get('created') or '')[:19] >= cut), key=lambda e: e[1].get('created') or '')
+    cards = []
+    for src, c, v, mname, hit in fresh:
         link = f"https://www.roblox.com/catalog/{c['id']}"
-        card = {'author': {'name': 'UGC Watch'}, 'title': c['name'][:250], 'url': link, 'color': 15105570 if hit else 3108845, 'description': f"{('New' if src == 'new' else 'Existing')} UGC {KIND.get(c.get('atype'), 'Accessory')}\n[Roblox Page]({link})" + ('\n**Flagged, see the alerts channel**' if hit else ''), 'fields': [fld('Price', cost(c)), fld('Creator', who(c)), fld('Closest to yours', f'{pct(v):.0%} · {mname[:40]}' if mname else 'none'), fld('Uploaded', when(c.get('created') or ''))], 'footer': {'text': 'Checked'}, 'timestamp': stamp()}
+        card = {'author': {'name': 'UGC Watch'}, 'title': c['name'][:250], 'url': link, 'color': 15105570 if hit else 3108845, 'description': f"New UGC {KIND.get(c.get('atype'), 'Accessory')}\n[Roblox Page]({link})" + ('\n**Flagged, see the alerts channel**' if hit else ''), 'fields': [fld('Price', cost(c)), fld('Creator', who(c)), fld('Closest to yours', f'{pct(v):.0%} · {mname[:40]}' if mname else 'none'), fld('Uploaded', when(c.get('created') or ''))], 'footer': {'text': 'Checked'}, 'timestamp': stamp()}
         if c.get('thumb'):
             card['thumbnail'] = {'url': c['thumb']}
-        if c.get('m3d'):
-            solo.append([card] + mesh_cards(c['m3d'], card['color']))
-            continue
         cards.append(card)
-    for group in solo:
-        send(cfg, {'username': 'UGC Watch', 'embeds': group}, url)
-        time.sleep(1.0)
-    if len(ev) > cap:
-        cards.append({'description': f'-# plus {len(ev) - cap} more that look nothing like your items', 'color': 2829617})
+    STATS['live'] += len(cards)
     for k in range(0, len(cards), 10):
         send(cfg, {'username': 'UGC Watch', 'embeds': cards[k:k + 10]}, url)
         time.sleep(1.0)
@@ -1191,11 +1237,16 @@ def report(db, cfg, started):
     n_mine = db.execute('select count(*) from mine').fetchone()[0]
     t = TIERS
     found = [f'**{t[k]}** {name}' for k, name in (('strong', 'strong takedown case'), ('possible', 'possible takedown case'), ('remake', 'possible remake'), ('text', 'copied listing text'), ('similar', 'similar look and name')) if t.get(k)]
+    items = [f'[{nm[:60]}](https://www.roblox.com/catalog/{i}) · {cr[:24]} · {TIER_NAMES.get(k, k)}' for k, i, nm, cr in PENDING.get('found', [])[:20]]
+    if items:
+        found += [''] + items
     lines = ['\n'.join(found) if found else 'No new look-alikes.', '', f"Fully checked **{STATS['checked']}** items against your **{n_mine}** in {max(1, round((now - started) / 60))} min", f'Checked <t:{int(now)}:f>', f'Next check around <t:{nxt}:f>']
     sc = kv_get(db, 'scan_stats', {})
     if sc.get('files'):
         queued = db.execute('select count(*) from deep').fetchone()[0] if db.execute("select 1 from sqlite_master where name='deep'").fetchone() else 0
-        lines += [f"Catalog scanner (<t:{int(sc['at'])}:R>, {sc['files']}/10 machines in): compared **{sc['compared']:,}** items by picture, **{sc['handed']}** look-alikes sent for the full check, **{queued}** still queued"]
+        lines += [f"Catalog scanner (<t:{int(sc['at'])}:R>, {sc['files']}/10 machines in): " + (f"compared **{sc['compared']:,}** items by picture, " if sc.get('compared') else f"searched **{sc['found']:,}** items, " if sc.get('found') else '') + f"**{sc['handed']}** look-alikes sent for the full check, **{queued}** still queued"]
+    if STATS.get('live'):
+        lines.append(f"New uploads watched live: **{STATS['live']}** posted to the feed as they appeared")
     near = db.execute("select id,name,visual,creator from checked where at>=? and verdict='' and visual>=0.43 and (ai like 'similar%' or ai like 'remake%' or ai like 'same%' or (ai='' and visual>=0.6)) order by visual desc limit 6", (started,)).fetchall()
     if near:
         lines += ['', '**Closest ones not flagged**'] + [f'`{pct(r[2]):>4.0%}` [{r[1][:50]}](https://www.roblox.com/catalog/{r[0]}) · {r[3][:22]}' for r in near]
@@ -1352,6 +1403,8 @@ def _cycle(db, cfg):
     types = {m['atype'] for m in mine} | set(cfg['extra_asset_types'])
     budget = cfg['max_alerts_per_cycle']
     deadline = time.time() + cfg['max_run_minutes'] * 60
+    LIVE.update(ctx=(db, cfg, mine, types), last=0, busy=False)
+    live_poll(catch_up=True)
     if ai_ready(cfg, db):
         ids = [r[0] for r in db.execute('select id from later limit ?', (int(os.environ.get('DEEP_PER_RUN', 150)),))]
         if ids:
@@ -1366,20 +1419,6 @@ def _cycle(db, cfg):
                     mark(db, i)
             db.commit()
             log(f'looked again at {len(ids)} items that were waiting for an AI review')
-    for sub in sorted({SUBCAT.get(t, 0) for t in types}):
-        params = {'Subcategory': sub} if sub else {}
-        got = stale = 0
-        for page in search_wide(CATALOG.replace('/details', ''), cfg.get('feed_wide_pages', 4) * (1 if sub else 4), Category=11, SortType=3, salesTypeFilter=1, **params):
-            new = [d['id'] for d in page if d.get('itemType') == 'Asset' and (not is_seen(db, d['id']))]
-            got += len(new)
-            items = details_batch(new)
-            for i in set(new) - {d['id'] for d in items}:
-                mark(db, i)
-            budget -= process(db, cfg, mine, items, types, budget)
-            stale = 0 if new else stale + 1
-            if stale >= 2:
-                break
-        log(f"feed {('subcategory %d' % sub if sub else 'all accessories')}: {got} new items")
     ingest_scans(db)
     rows = db.execute('select id, raw from deep order by score desc limit ?', (int(os.environ.get('DEEP_PER_RUN', 150)),)).fetchall()
     if rows and time.time() < deadline:
@@ -1422,6 +1461,46 @@ def _cycle(db, cfg):
                 budget -= process(db, cfg, mine, items, {8, 41, 42, 43, 44, 45, 46, 47}, budget, 'scan')
         log(f'checked the stores of {len(names)} flagged creators')
         kv_set(db, 'stores_at', time.time())
+
+def live_poll(catch_up=False):
+    if LIVE['busy'] or not LIVE.get('ctx'):
+        return
+    db, cfg, mine, types = LIVE['ctx']
+    if not catch_up and time.time() - LIVE['last'] < cfg.get('live_poll_seconds', 20):
+        return
+    LIVE['busy'] = True
+    try:
+        for sub in sorted({SUBCAT.get(t, 0) for t in types}):
+            params = {'Subcategory': sub} if sub else {}
+            got = stale = 0
+            pages = cfg.get('feed_wide_pages', 4) * (1 if sub else 4) if catch_up else 2
+            for page in search_wide(CATALOG.replace('/details', ''), pages, Category=11, SortType=3, salesTypeFilter=1, **params):
+                new = [d['id'] for d in page if d.get('itemType') == 'Asset' and (not is_seen(db, d['id']))]
+                got += len(new)
+                items = details_batch(new) if new else []
+                for i in set(new) - {d['id'] for d in items}:
+                    mark(db, i)
+                process(db, cfg, mine, items, types, cfg.get('max_alerts_per_cycle', 40))
+                stale = 0 if new else stale + 1
+                if stale >= (2 if catch_up else 1):
+                    break
+            if got:
+                log(f"feed {('subcategory %d' % sub if sub else 'all accessories')}: {got} new items")
+        post_feed(cfg)
+    except Exception as e:
+        log('live feed error:', repr(e)[:160])
+    finally:
+        LIVE['busy'] = False
+        LIVE['last'] = time.time()
+
+def live_until_end():
+    if not LIVE.get('ctx'):
+        return
+    cfg = LIVE['ctx'][1]
+    while time.time() < HARD['t'] - 75:
+        live_poll()
+        time.sleep(max(1.0, cfg.get('live_poll_seconds', 20) - (time.time() - LIVE['last'])))
+LIVE = {'ctx': None, 'last': 0, 'busy': False}
 
 def main():
     ap = argparse.ArgumentParser()
