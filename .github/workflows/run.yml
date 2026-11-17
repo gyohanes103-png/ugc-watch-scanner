@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: read
+  actions: write
 
 concurrency:
   group: run
@@ -19,7 +20,7 @@ jobs:
     env:
       PUBLIC_LOG: "1"
       RUN_MINUTES: "27"
-      DEEP_PER_RUN: "5000"
+      DEEP_PER_RUN: "1000000000"
       DATA_REPO: ${{ secrets.DATA_REPO }}
       DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
       FEED_WEBHOOK_URL: ${{ secrets.FEED_WEBHOOK_URL }}
@@ -34,6 +35,11 @@ jobs:
           token: ${{ secrets.DATA_TOKEN }}
           path: data
           ref: main
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          last=$(gh run list -R "$GITHUB_REPOSITORY" -w sync.yml -L 1 --json createdAt -q ".[0].createdAt" 2>/dev/null || true)
+          if [ -z "$last" ] || [ $(( $(date +%s) - $(date -d "$last" +%s) )) -gt 10500 ]; then gh workflow run sync.yml -R "$GITHUB_REPOSITORY" || true; fi
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
