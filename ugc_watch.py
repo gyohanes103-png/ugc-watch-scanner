@@ -1353,7 +1353,7 @@ def cycle(db, cfg):
         db.execute("insert or ignore into later select id from checked where verdict='' and ai='' and visual>=?",
                    (cfg["ai_min_visual"],))
         kv_set(db, "requeue_v1", 1)
-    HARD["t"] = time.time() + 17 * 60
+    HARD["t"] = time.time() + float(os.environ.get("RUN_MINUTES", 17)) * 60
     MYM["list"] = None
     if not kv_get(db, "fix_inner_v1"):           # one-off: drop flags raised only by Roblox's default file names
         db.execute("update checked set verdict='' where verdict like '%internal name%'")
@@ -1555,8 +1555,9 @@ def report(db, cfg, started):
                  "3D model check: Roblox sign-in FAILED, the cookie has expired or is wrong")
     if STATS["note"]:
         lines.append("AI problem: " + STATS["note"])
-    if os.environ.get("GITHUB_REPOSITORY"):
-        lines.append(f"[Full report](https://github.com/{os.environ['GITHUB_REPOSITORY']}/blob/main/REPORT.md)")
+    repo = os.environ.get("DATA_REPO") or os.environ.get("GITHUB_REPOSITORY")   # the report lives with the data
+    if repo:
+        lines.append(f"[Full report](https://github.com/{repo}/blob/main/REPORT.md)")
     title = f"{a} new look-alike{'s' if a != 1 else ''} found" if a else "All clear"
     send(cfg, {"username": "UGC Watch", "embeds": [{"title": title, "color": 0xE67E22 if a else 0x2ECC71,
                                                      "description": "\n".join(lines), "timestamp": stamp()}]})
@@ -1751,7 +1752,7 @@ def _cycle(db, cfg):
         log(f"feed {'subcategory %d' % sub if sub else 'all accessories'}: {got} new items")
 
     ingest_scans(db)
-    rows = db.execute("select id, raw from deep order by score desc limit 150").fetchall()
+    rows = db.execute("select id, raw from deep order by score desc limit ?", (int(os.environ.get("DEEP_PER_RUN", 150)),)).fetchall()
     if rows and time.time() < deadline:          # look-alikes found by the catalog scanner
         ids = [r[0] for r in rows]
         db.execute(f"delete from deep where id in ({','.join(map(str, ids))})"); db.commit()
@@ -1777,7 +1778,7 @@ def _cycle(db, cfg):
                 page = [d for d in page if (d.get("itemCreatedUtc") or "9") >= since]
                 n += len(page)
                 budget -= process(db, cfg, mine, page, types, budget, "scan")
-            log(f"scan '{kw}': {n} items uploaded since {since[:10]}")
+            log(f"  scan '{kw}': {n} items uploaded since {since[:10]}")
             pos += 1; kv_set(db, "sweep_pos", pos)
         kv_set(db, "sweep_pos", 0); kv_set(db, "sweep_at", time.time())
 
@@ -1805,6 +1806,8 @@ def main():
     a = ap.parse_args()
     if a.data:
         globals()["HERE"] = pathlib.Path(a.data).resolve()
+    if os.environ.get("PUBLIC_LOG"):             # running in the public repo: counts only in the log
+        QUIET["on"] = True
     cfg = dict(DEFAULTS)
     cp = HERE / "config.json"
     if cp.exists():
