@@ -1287,6 +1287,9 @@ def decide(db, cfg, mine, cand, feat, raw_png, left, src="new"):
                 level = ("Possible REMAKE of your model (3D shape very close)", 0xE67E22, 0.7)
             if level:
                 res.update(verdict=level[0], colour=level[1], confidence=max(res["confidence"], level[2]), match=mm)
+            elif res["verdict"] and res["verdict"].startswith("Possible REMAKE") and (vox or 0) < 0.3 \
+                    and r is not None and r < 0.45 and res["visual"] < 0.45:
+                res.update(verdict="Similar look and name (3D model differs from yours)", colour=0x3498DB)   # meshes clearly differ
     hit = bool(res and res["verdict"])
     if hit and cand.get("cid") in cfg.get("low_priority_creator_ids", []) and tier(res["verdict"]) > 0:
         hit = False                              # creator you reviewed: only outright copies alert
@@ -1526,9 +1529,15 @@ def report(db, cfg, started):
     found = [f"**{t[k]}** {name}" for k, name in (("strong", "strong takedown case"), ("possible", "possible takedown case"),
              ("remake", "possible remake"), ("text", "copied listing text"), ("similar", "similar look and name")) if t.get(k)]
     lines = ["\n".join(found) if found else "No new look-alikes.", "",
-             f"Checked **{STATS['checked']}** items against your **{n_mine}** in {max(1, round((now - started) / 60))} min",
+             f"Fully checked **{STATS['checked']}** items against your **{n_mine}** in {max(1, round((now - started) / 60))} min",
              f"Checked <t:{int(now)}:f>", f"Next check around <t:{nxt}:f>"]
-    near = db.execute("select id,name,visual,creator from checked where at>=? and verdict='' and (ai like 'similar%' or ai like 'remake%' or ai like 'same%' or (ai='' and visual>=0.6)) "
+    sc = kv_get(db, "scan_stats", {})
+    if sc.get("files"):
+        queued = db.execute("select count(*) from deep").fetchone()[0] if db.execute(
+            "select 1 from sqlite_master where name='deep'").fetchone() else 0
+        lines += [f"Catalog scanner (<t:{int(sc['at'])}:R>, {sc['files']}/10 machines in): compared **{sc['compared']:,}** "
+                  f"items by picture, **{sc['handed']}** look-alikes sent for the full check, **{queued}** still queued"]
+    near = db.execute("select id,name,visual,creator from checked where at>=? and verdict='' and visual>=0.43 and (ai like 'similar%' or ai like 'remake%' or ai like 'same%' or (ai='' and visual>=0.6)) "
                       "order by visual desc limit 6", (started,)).fetchall()
     if near:
         lines += ["", "**Closest ones not flagged**"] + [
@@ -1597,6 +1606,11 @@ def selftest(db, cfg):
 # to the private watcher, which runs the AI and 3D checks on them.
 TAXONOMY = {8: "thukPQUFe5EHxRrtsgq43u", 43: "tvckLAbtDAGwF9Y2sph2Ce", 44: "8i1sggNTrxoN799hpRrR1S",
             45: "kj535RzJxHTCnXPBLo5KaE", 46: "7yGywzp5JeDsNjhXWJqSw3", 47: "6jYQPDtkVwQZcKtvVpyYAN"}
+TYPE_WORDS = {                                   # what copies of each kind are usually called, whatever your names say
+    8: "horns horn hat crown halo ears demon devil dragon helmet hood mask bow".split(),
+    46: "wings wing sword cape bag backpack angel demon dragon chain cross bow".split(),
+    47: "tail tails fluffy fox wolf cat kitsune bunny dragon demon devil furry plush chain belt bow".split(),
+    45: "fan sword chain plush bag".split(), 43: "chain choker necklace collar".split(), 44: "plush pet".split()}
 PRICE_BANDS = [(0, 64), (65, 65), (66, 75), (76, 90), (91, 110), (111, 150), (151, 250), (251, 600), (601, 10 ** 7)]
 
 
@@ -1612,7 +1626,8 @@ def scan_slices(mine):
         for lo, hi in PRICE_BANDS:
             for sort in (3, 2, 1):               # newest, best selling, most favourited
                 out.append({"taxonomy": tax, "SortType": sort, "MinPrice": lo, "MaxPrice": hi})
-        for w in sorted({w for m in items for w in tokens(m["name"]) if len(w) >= 3}):
+        words = {w for m in items for w in tokens(m["name"]) if len(w) >= 3} | set(TYPE_WORDS.get(t, ()))
+        for w in sorted(words):
             for lo, hi in PRICE_BANDS:
                 out.append({"taxonomy": tax, "Keyword": w, "SortType": 0, "MinPrice": lo, "MaxPrice": hi})
     return out
@@ -1652,14 +1667,15 @@ def scan_shard(db, cfg, shard, total, minutes=24):
             cand = to_cand(d); cand["thumb"] = u
             res = judge(cand, feats[u][0], mine, cfg)
             scored += 1
-            if res and (res["verdict"] or res["visual"] >= cfg.get("scan_min_visual", 0.6) or res["name"] >= 0.6
+            if res and (res["verdict"] or res["visual"] >= cfg.get("scan_min_visual", 0.5) or res["name"] >= 0.6
                         or res["desc"] >= 0.3 or res["credit"]):
                 keep.append((max(res["visual"], res["name"] * 0.9, res["desc"]), d))
     keep = [d | {"_score": round(s, 3)} for s, d in sorted(keep, key=lambda x: -x[0])[:cfg.get("scan_max_per_shard", 400)]]
     out = HERE / "scan"
     out.mkdir(exist_ok=True)
     name = f"{os.environ.get('GITHUB_RUN_ID', int(time.time()))}-{shard}.json.gz"
-    (out / name).write_bytes(gzip.compress(json.dumps(keep).encode()))
+    stats = {"slices": done, "of": len(slices), "found": len(found), "compared": scored, "handed": len(keep)}
+    (out / name).write_bytes(gzip.compress(json.dumps({"stats": stats, "items": keep}).encode()))
     log(f"compared {scored} items by picture, {len(keep)} look-alikes handed to the watcher")
 
 
@@ -1669,7 +1685,20 @@ def ingest_scans(db):
     read, n = [], 0
     for f in sorted((HERE / "scan").glob("*.json.gz")) if (HERE / "scan").exists() else []:
         try:
-            for d in json.loads(gzip.decompress(f.read_bytes())):
+            blob = json.loads(gzip.decompress(f.read_bytes()))
+            items = blob["items"] if isinstance(blob, dict) else blob
+            st = blob.get("stats", {}) if isinstance(blob, dict) else {"handed": len(blob)}
+            tot = kv_get(db, "scan_stats", {})
+            run = f.name.split("-")[0]
+            if tot.get("run") != run:            # a new scan: start counting again
+                tot = {"run": run, "at": time.time(), "found": 0, "compared": 0, "handed": 0, "files": 0, "seen": []}
+            if f.name not in tot.setdefault("seen", []):         # a file is only counted once
+                for k in ("found", "compared", "handed"):
+                    tot[k] = tot.get(k, 0) + st.get(k, 0)
+                tot["files"] = tot.get("files", 0) + 1
+                tot["seen"].append(f.name)
+            kv_set(db, "scan_stats", tot)
+            for d in items:
                 if not is_seen(db, d["id"]):
                     db.execute("insert or ignore into deep values(?,?,?)", (d["id"], d.get("_score", 0), json.dumps(d)))
                     n += 1
