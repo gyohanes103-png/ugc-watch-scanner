@@ -1818,7 +1818,7 @@ def live_poll(catch_up=False):
         got = posted = 0
         pages = cfg.get('feed_catch_up_pages', 60) if catch_up or first else cfg.get('feed_live_pages', 10)
         url = CATALOG.replace('/v1/', '/v2/')
-        recheck = [r[0] for r in db.execute('select id from feedwait where at<? order by at limit 100', (time.time() - cfg.get('feed_recheck_seconds', 600),))]
+        recheck = [r[0] for r in db.execute('select id from feedwait where at<? order by at limit 500', (time.time() - cfg.get('feed_recheck_seconds', 90),))]
         lists = [{'IncludeNotForSale': 'true'}]
         if catch_up or first or time.time() - LIVE.get('onsale_at', 0) > cfg.get('feed_onsale_seconds', 120):
             lists.append({'salesTypeFilter': 1})
@@ -1827,7 +1827,8 @@ def live_poll(catch_up=False):
             quick = {} if catch_up or first else {'tries': 3, 'max_wait': 12}
             for page in search_wide(url, pages, Category=1, SortType=3, **quick, **params):
                 page = [d for d in page if d.get('itemType') == 'Asset']
-                new = [d for d in page if not db.execute('select 1 from fed where id=?', (d['id'],)).fetchone() and (not db.execute('select 1 from feedwait where id=?', (d['id'],)).fetchone())]
+                on_sale = lambda d: d.get('price') is not None or d.get('lowestPrice') is not None
+                new = [d for d in page if not db.execute('select 1 from fed where id=?', (d['id'],)).fetchone() and (on_sale(d) or not db.execute('select 1 from feedwait where id=?', (d['id'],)).fetchone())]
                 if not new:
                     break
                 got += len(new)
@@ -1897,8 +1898,12 @@ def feed_cards(db, cfg, items):
             fields.append(fld('Closest to yours', 'your own item'))
         elif e:
             fields.append(fld('Closest to yours', f'{pct(e[2]):.0%} · {e[3][:40]}' if e[3] else 'none'))
-        fields.append(fld('Uploaded', when(c.get('created') or '')))
-        card = {'author': {'name': 'UGC Watch'}, 'title': c['name'][:250], 'url': link, 'color': 15105570 if hit else 3066993 if mine_item else 3108845, 'description': f"New UGC {ASSET_KIND.get(c.get('atype'), 'Item')}\n[Roblox Page]({link})" + ('\n**Flagged, see the alerts channel**' if hit else ''), 'fields': fields, 'footer': {'text': 'Found'}, 'timestamp': stamp()}
+        try:
+            up = calendar.timegm(time.strptime((c.get('created') or '')[:19], '%Y-%m-%dT%H:%M:%S'))
+            fields.append(fld('File uploaded', f'<t:{up}:R>'))
+        except ValueError:
+            pass
+        card = {'author': {'name': 'UGC Watch'}, 'title': c['name'][:250], 'url': link, 'color': 15105570 if hit else 3066993 if mine_item else 3108845, 'description': f"New UGC {ASSET_KIND.get(c.get('atype'), 'Item')}\n[Roblox Page]({link})" + ('\n**Flagged, see the alerts channel**' if hit else ''), 'fields': fields, 'footer': {'text': 'Listed on Roblox'}, 'timestamp': stamp()}
         if isinstance(u, str) and u.startswith('http'):
             card['thumbnail'] = {'url': u}
         cards.append(card)
