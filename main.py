@@ -103,14 +103,16 @@ LIMIT = Limiter()
 
 def _host(url):
     return url.split('/')[2] if '//' in url else url
+AUTH = {'cookie': ''}
 
-def http_json(url, params=None, tries=6, max_wait=90):
-    host = _host(url)
+def http_json(url, params=None, tries=6, max_wait=90, signed_in=False):
+    host = _host(url) + ('+you' if signed_in and AUTH['cookie'] else '')
+    head = {'Cookie': '.ROBLOSECURITY=' + AUTH['cookie']} if signed_in and AUTH['cookie'] else None
     for _ in range(tries):
         if not LIMIT.before(host, max_wait):
             return None
         try:
-            r = sess.get(url, params=params, timeout=25)
+            r = sess.get(url, params=params, timeout=25, headers=head)
         except requests.RequestException as e:
             log('  network error:', e)
             time.sleep(2)
@@ -303,13 +305,22 @@ def search(pages, **params):
         cursor = j.get('nextPageCursor')
         if not cursor:
             return
+UNANSWERED = set()
 
 def thumb_urls(ids):
     out = {}
     ids = list(ids)
     for i in range(0, len(ids), 100):
-        j = http_json(THUMBS, {'assetIds': ','.join(map(str, ids[i:i + 100])), 'size': '420x420', 'format': 'Png', 'isCircular': 'false'})
-        for d in (j or {}).get('data', []):
+        part = ids[i:i + 100]
+        q = {'assetIds': ','.join(map(str, part)), 'size': '420x420', 'format': 'Png', 'isCircular': 'false'}
+        first = AUTH['cookie'] and (not AUTH.get('scanner'))
+        j = http_json(THUMBS, q, signed_in=bool(first))
+        if j is None and AUTH['cookie']:
+            j = http_json(THUMBS, q, tries=2, max_wait=20, signed_in=not first)
+        if j is None:
+            UNANSWERED.update(part)
+            continue
+        for d in j.get('data', []):
             out[d['targetId']] = d.get('imageUrl') if d.get('state') == 'Completed' else d.get('state')
     return out
 
@@ -2132,6 +2143,10 @@ def check_deep(db, cfg, mine, types, chunk=None):
     back = [r for r in rows if not is_seen(db, r[0])]
     for i, raw in back:
         d = json.loads(raw)
+        if i in UNANSWERED:
+            UNANSWERED.discard(i)
+            db.execute('insert or ignore into deep values(?,?,?)', (i, d.get('_score', 0) - 10 * d.get('_tries', 0), raw))
+            continue
         d['_tries'] = d.get('_tries', 0) + 1
         if d['_tries'] >= cfg.get('deep_tries', 4):
             mark(db, i)
@@ -2241,12 +2256,14 @@ def main():
     for key, env in (('discord_webhook_url', 'DISCORD_WEBHOOK_URL'), ('anthropic_api_key', 'ANTHROPIC_API_KEY'), ('gemini_api_key', 'GEMINI_API_KEY'), ('feed_webhook_url', 'FEED_WEBHOOK_URL'), ('roblox_cookie', 'ROBLOX_COOKIE')):
         if os.environ.get(env):
             cfg[key] = os.environ[env].strip()
+    AUTH['cookie'] = cfg.get('roblox_cookie') or ''
     if cfg['discord_webhook_url'].startswith('PASTE'):
         cfg['discord_webhook_url'] = ''
     if not cfg['my_creator_id']:
         sys.exit('Set my_creator_id in config.json')
     db = db_open()
     if a.shard:
+        AUTH['scanner'] = True
         i, n = map(int, a.shard.split('/'))
         scan_shard(db, cfg, i, n)
         return
