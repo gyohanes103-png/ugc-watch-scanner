@@ -268,7 +268,7 @@ def handles(s):
     return set(re.findall('@\\w{3,}', s or ''))
 
 def db_open():
-    db = sqlite3.connect(HERE / 'ugc_watch.db')
+    db = sqlite3.connect(HERE / 'ugc_watch.db', check_same_thread=False)
     db.executescript('\n      create table if not exists seen(id integer primary key, at real);\n      create table if not exists mine(id integer primary key, name text, descr text,\n                                      created text, atype int, thumb text, feat blob);\n      create table if not exists kv(k text primary key, v text);\n      create table if not exists later(id integer primary key);\n      create table if not exists mesh3d(id integer primary key, at real, name text, creator text, mine_id int,\n        mine_name text, mesh_id int, tex_id int, my_mesh_id int, my_tex_id int, score real, render real,\n        texsim real, info text);')
     return db
 
@@ -456,25 +456,34 @@ def ai_compare(cfg, db, mine_png, theirs_png, mine_name, theirs_name):
     a, b = sorted(got, key=lambda o: SEVERITY.index(o['relation']))
     agree = a['relation'] == b['relation']
     return {'relation': a['relation'], 'confidence': max(a['confidence'], b['confidence']) if agree else min(a['confidence'], b['confidence']), 'reason': ' | '.join((f"{o['provider']}: {o['relation'].replace('_', ' ')}, {o['reason']}" for o in got))[:600], 'provider': 'both agree' if agree else 'they disagree'}
+import threading
+AILOCK = threading.RLock()
 
 def ai_one(cfg, db, mine_png, theirs_png, mine_name, theirs_name, prov):
     if not prov or not mine_png or (not theirs_png):
         return None
     day = time.strftime('%Y-%m-%d')
-    used = kv_get(db, 'ai_calls', {})
-    if used.get(day, 0) >= cfg['ai_max_calls_per_day']:
-        return None
-    spend = kv_get(db, 'ai_spend', {})
-    if spend.get(day, 0) >= ai_allowance(cfg, db):
-        STATS['note'] = 'daily AI budget reached, the rest waits for tomorrow'
-        return None
+    with AILOCK:
+        used = kv_get(db, 'ai_calls', {})
+        if used.get(day, 0) >= cfg['ai_max_calls_per_day']:
+            return None
+        spend = kv_get(db, 'ai_spend', {})
+        if spend.get(day, 0) >= ai_allowance(cfg, db):
+            STATS['note'] = 'daily AI budget reached, the rest waits for tomorrow'
+            return None
     prompt = AI_PROMPT.format(mine=mine_name[:80], theirs=theirs_name[:80])
     a, b = (_ai_png(mine_png), _ai_png(theirs_png))
     try:
-        if prov == 'anthropic':
-            r = requests.post('https://api.anthropic.com/v1/messages', timeout=60, headers={'x-api-key': cfg['anthropic_api_key'], 'anthropic-version': '2023-06-01', 'content-type': 'application/json', **({'anthropic-workspace-id': cfg['anthropic_workspace_id']} if cfg['anthropic_workspace_id'] else {})}, json={'model': cfg['anthropic_model'], 'max_tokens': 1500, 'messages': [{'role': 'user', 'content': [{'type': 'image', 'source': {'type': 'base64', 'media_type': 'image/png', 'data': a}}, {'type': 'image', 'source': {'type': 'base64', 'media_type': 'image/png', 'data': b}}, {'type': 'text', 'text': prompt}]}]})
-        else:
-            r = requests.post(f"https://generativelanguage.googleapis.com/v1beta/models/{cfg['gemini_model']}:generateContent", timeout=60, headers={'x-goog-api-key': cfg['gemini_api_key'], 'content-type': 'application/json'}, json={'contents': [{'parts': [{'inline_data': {'mime_type': 'image/png', 'data': a}}, {'inline_data': {'mime_type': 'image/png', 'data': b}}, {'text': prompt}]}]})
+        for attempt in range(4):
+            if prov == 'anthropic':
+                r = requests.post('https://api.anthropic.com/v1/messages', timeout=60, headers={'x-api-key': cfg['anthropic_api_key'], 'anthropic-version': '2023-06-01', 'content-type': 'application/json', **({'anthropic-workspace-id': cfg['anthropic_workspace_id']} if cfg['anthropic_workspace_id'] else {})}, json={'model': cfg['anthropic_model'], 'max_tokens': 1500, 'messages': [{'role': 'user', 'content': [{'type': 'image', 'source': {'type': 'base64', 'media_type': 'image/png', 'data': a}}, {'type': 'image', 'source': {'type': 'base64', 'media_type': 'image/png', 'data': b}}, {'type': 'text', 'text': prompt}]}]})
+            else:
+                r = requests.post(f"https://generativelanguage.googleapis.com/v1beta/models/{cfg['gemini_model']}:generateContent", timeout=60, headers={'x-goog-api-key': cfg['gemini_api_key'], 'content-type': 'application/json'}, json={'contents': [{'parts': [{'inline_data': {'mime_type': 'image/png', 'data': a}}, {'inline_data': {'mime_type': 'image/png', 'data': b}}, {'text': prompt}]}]})
+            wait = r.headers.get('retry-after') if r.status_code in (429, 529) else None
+            if wait and attempt < 3 and (float(wait) <= 60) and ('credit' not in r.text.lower()):
+                time.sleep(float(wait) + 0.5)
+                continue
+            break
         if r.status_code != 200:
             STATS['ai_failed'] += 1
             STATS['note'] = f'{prov} returned HTTP {r.status_code}'
@@ -491,8 +500,10 @@ def ai_one(cfg, db, mine_png, theirs_png, mine_name, theirs_name, prov):
         STATS['ai_ok'] += 1
         u = body.get('usage', {}) if prov == 'anthropic' else {}
         cost = (u.get('input_tokens', 0) * cfg.get('ai_price_in', 0.1) + u.get('output_tokens', 0) * cfg.get('ai_price_out', 0.5)) / 1000000.0
-        kv_set(db, 'ai_spend', {day: spend.get(day, 0) + cost, 'total': spend.get('total', 0) + cost})
-        kv_set(db, 'ai_calls', {day: used.get(day, 0) + 1})
+        with AILOCK:
+            spend, used = (kv_get(db, 'ai_spend', {}), kv_get(db, 'ai_calls', {}))
+            kv_set(db, 'ai_spend', {day: spend.get(day, 0) + cost, 'total': spend.get('total', 0) + cost})
+            kv_set(db, 'ai_calls', {day: used.get(day, 0) + 1})
         m = re.search('\\{.*\\}', text, re.S)
         if not m:
             STATS['ai_failed'] += 1
@@ -1170,10 +1181,37 @@ def my_models(db, cfg, mine):
     names = {m['id']: m for m in mine}
     return [(names[i], pickle.loads(b)) for i, b in have.items() if i in names]
 
+def wants_ai(res, cfg):
+    return bool(res and (res['verdict'] or res['visual'] >= cfg['ai_min_visual'] or res['name'] >= 0.6 or (res['desc'] >= 0.3) or res['credit']) and res['visual_match'])
+JUDGED, AICACHE = ({}, {})
+
+def prefetch_ai(db, cfg, mine, fresh, urls, feats):
+    if not ai_provider(cfg) or not ai_ready(cfg, db):
+        return
+    jobs = []
+    for cid, cand in fresh.items():
+        u = urls.get(cid)
+        if not (isinstance(u, str) and u.startswith('http')):
+            continue
+        feat, raw_png = feats[u]
+        res = JUDGED[cid] = judge(cand, feat, mine, cfg)
+        if not wants_ai(res, cfg) or not raw_png:
+            continue
+        vm = res['visual_match']
+        if 'png' not in vm:
+            vm['png'] = fetch_feat(vm['thumb'])[1] if vm['thumb'] else None
+        jobs.append((cid, vm['png'], raw_png, vm['name'], cand['name']))
+    if not jobs:
+        return
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(int(cfg.get('ai_parallel', 8))) as ex:
+        outs = list(ex.map(lambda j: ai_compare(cfg, db, *j[1:]), jobs))
+    AICACHE.update({j[0]: o for j, o in zip(jobs, outs)})
+
 def decide(db, cfg, mine, cand, feat, raw_png, left, src='new'):
     STATS['checked'] += 1
-    res = judge(cand, feat, mine, cfg)
-    wants = bool(res and (res['verdict'] or res['visual'] >= cfg['ai_min_visual'] or res['name'] >= 0.6 or (res['desc'] >= 0.3) or res['credit']) and res['visual_match'])
+    res = JUDGED.pop(cand['id']) if cand['id'] in JUDGED else judge(cand, feat, mine, cfg)
+    wants = wants_ai(res, cfg)
     if wants and ai_provider(cfg) and (left <= 0 or not ai_ready(cfg, db)):
         db.execute('insert or ignore into later values(?)', (cand['id'],))
         mark(db, cand['id'])
@@ -1183,10 +1221,14 @@ def decide(db, cfg, mine, cand, feat, raw_png, left, src='new'):
             ACTIVITY.append((src, cand, res['visual'], near['name'] if near else '', False))
         return 0
     if wants and ai_provider(cfg) and (left > 0):
-        vm = res['visual_match']
-        if 'png' not in vm:
-            vm['png'] = fetch_feat(vm['thumb'])[1] if vm['thumb'] else None
-        res = apply_ai(res, ai_compare(cfg, db, vm['png'], raw_png, vm['name'], cand['name']), cfg)
+        if cand['id'] in AICACHE:
+            ai = AICACHE.pop(cand['id'])
+        else:
+            vm = res['visual_match']
+            if 'png' not in vm:
+                vm['png'] = fetch_feat(vm['thumb'])[1] if vm['thumb'] else None
+            ai = ai_compare(cfg, db, vm['png'], raw_png, vm['name'], cand['name'])
+        res = apply_ai(res, ai, cfg)
     close = bool(res and res['visual_match'] and (res['verdict'] or res['visual'] >= cfg['ai_min_visual'] or res['name'] >= 0.6 or (res['desc'] >= 0.3) or res['credit'] or (res['ai'] and res['ai']['relation'] != 'unrelated')))
     want3d = bool(res and cfg.get('roblox_cookie') and res['visual_match'])
     if want3d and src != 'new':
@@ -1283,6 +1325,7 @@ def process(db, cfg, mine, raw, types, budget, src='new'):
     urls, feats = get_thumbs(fresh)
     if src != 'new' and len(fresh) > 1:
         prefetch_models(list(fresh), cfg)
+        prefetch_ai(db, cfg, mine, fresh, urls, feats)
     sent = 0
     for cid, cand in fresh.items():
         if time.time() > HARD['t']:
@@ -1299,6 +1342,8 @@ def process(db, cfg, mine, raw, types, budget, src='new'):
         sent += decide(db, cfg, mine, cand, feat, raw_png, budget - sent, src) or 0
     for cid in fresh:
         MDESC.pop(cid, None)
+        JUDGED.pop(cid, None)
+        AICACHE.pop(cid, None)
     return sent
 
 def cycle(db, cfg):
