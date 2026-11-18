@@ -1147,9 +1147,9 @@ def texture_score(a, b):
 def same_texture(a, b):
     return bool(a.get('tex_id') and a.get('tex_id') == b.get('tex_id') or (a.get('tex_sha') and a.get('tex_sha') == b.get('tex_sha')))
 
-def geo_compare(t, y):
+def geo_compare(t, y, shape=True):
     same = bool(t.get('mesh_id') and t.get('mesh_id') == y.get('mesh_id') or (t.get('sha') and t.get('sha') == y.get('sha')))
-    vox, slack = (1.0, 1.0) if same else vox_score(t.get('vox'), y.get('vox'))
+    vox, slack = (1.0, 1.0) if same else vox_score(t.get('vox'), y.get('vox')) if shape else (None, None)
     counts = bool((t.get('n') or 0) >= 200 and t.get('n') == y.get('n') and (t.get('nf') == y.get('nf')))
     mine_names = {_inner_name(n).lower() for n in y.get('names', [])} - {''}
     inner = [x for x in map(_inner_name, t.get('names', [])) if x and x.lower() in mine_names]
@@ -1248,9 +1248,14 @@ def decide(db, cfg, mine, cand, feat, raw_png, left, src='new'):
         pool = {m['id']: (m, d) for m, d in MYM['list']}
         if vm['mesh']:
             pool[vm['id']] = (vm, vm['mesh'])
-        scored = [(geo_strength(g), m, d, g) for m, d in pool.values() if d for g in [geo_compare(theirs, d)]]
+        quick = [(m, d, geo_compare(theirs, d, shape=False)) for m, d in pool.values() if d]
+        near = {m['id'] for m, d, g in sorted(quick, key=lambda x: -(x[2]['d2'] or 0))[:cfg.get('shape_top', 10)]}
+        near |= {vm['id']} | {m['id'] for m, d, g in quick if g['same_mesh'] or g['counts'] or g['inner'] or g['same_tex']}
+        scored = [(geo_strength(g), m, d, g) for m, d, g0 in quick for g in [geo_compare(theirs, d) if m['id'] in near else g0]]
         if scored:
             strength, m, d, g = max(scored, key=lambda x: x[0])
+            if g['vox'] is None and d.get('vox') is not None:
+                g = geo_compare(theirs, d)
             if strength < 0.75 and vm['mesh']:
                 m, d, g = (vm, vm['mesh'], geo_compare(theirs, vm['mesh']))
             if not theirs.get('_pv') and (g['same_mesh'] or g['same_tex'] or g['inner'] or ((g['vox'] or 0) >= 0.45) or ((g['slack'] or 0) >= 0.8)):
@@ -1309,7 +1314,7 @@ def decide(db, cfg, mine, cand, feat, raw_png, left, src='new'):
     db.commit()
     return 1 if hit else 0
 
-def process(db, cfg, mine, raw, types, budget, src='new'):
+def process(db, cfg, mine, raw, types, budget, src='new', pre=None):
     skip = set(cfg['ignore_creator_ids']) | {cfg['my_creator_id']}
     fresh = {}
     for d in raw:
@@ -1322,7 +1327,7 @@ def process(db, cfg, mine, raw, types, budget, src='new'):
     db.commit()
     if not fresh:
         return 0
-    urls, feats = get_thumbs(fresh)
+    urls, feats = pre if pre and all((i in pre[0] for i in fresh)) else get_thumbs(fresh)
     if src != 'new' and len(fresh) > 1:
         prefetch_models(list(fresh), cfg)
         prefetch_ai(db, cfg, mine, fresh, urls, feats)
@@ -1937,8 +1942,11 @@ def live_poll(catch_up=False):
         db.execute('create table if not exists feedwait(id integer primary key, at real)')
         db.execute('create table if not exists feedpic(id integer primary key)')
         db.execute('create table if not exists feedfirst(id integer primary key, at real)')
+        if catch_up and (not kv_get(db, 'feedfirst_v2')):
+            db.execute('update feedfirst set at=min(at, ?)', (time.time() - 7200,))
+            kv_set(db, 'feedfirst_v2', 1)
         if catch_up:
-            db.execute('insert or ignore into feedfirst select id, at from feedwait')
+            db.execute('insert or ignore into feedfirst select id, at - 7200 from feedwait')
             db.execute('delete from feedfirst where id not in (select id from feedwait)')
         first = not kv_get(db, 'feed_since')
         if catch_up and (not first) and (not kv_get(db, 'feedwait_v2')):
@@ -1951,7 +1959,7 @@ def live_poll(catch_up=False):
         pages = cfg.get('feed_catch_up_pages', 60) if catch_up or first else cfg.get('feed_live_pages', 10)
         url = CATALOG.replace('/v1/', '/v2/')
         now = time.time()
-        recheck = [r[0] for r in db.execute('select w.id from feedwait w left join feedfirst f on f.id=w.id where w.at < ? - max(?, ? * (? - coalesce(f.at, w.at))) order by w.at limit 500', (now, cfg.get('feed_recheck_seconds', 90), cfg.get('feed_recheck_share', 0.03), now))]
+        recheck = [r[0] for r in db.execute('select w.id from feedwait w left join feedfirst f on f.id=w.id where w.at < ? - case when ? - coalesce(f.at, w.at) < ? then ? else ? * (? - coalesce(f.at, w.at)) end order by w.at limit 500', (now, now, cfg.get('feed_young_seconds', 7200), cfg.get('feed_recheck_seconds', 90), cfg.get('feed_recheck_share', 0.25), now))]
         lists = [{'IncludeNotForSale': 'true'}]
         if catch_up or first or time.time() - LIVE.get('onsale_at', 0) > cfg.get('feed_onsale_seconds', 120):
             lists.append({'salesTypeFilter': 1})
@@ -2034,17 +2042,18 @@ def feed_items(db, cfg, mine, types, items, cut, recheck=False):
             show.append(d)
     show.sort(key=lambda d: d.get('itemCreatedUtc') or '')
     n = 0
+    pre = get_thumbs([d['id'] for d in show]) if show else ({}, {})
     for d in show:
-        process(db, cfg, mine, [d], ACCESSORY | types, cfg.get('max_alerts_per_cycle', 10 ** 9))
-        n += feed_cards(db, cfg, [d])
+        process(db, cfg, mine, [d], ACCESSORY | types, cfg.get('max_alerts_per_cycle', 10 ** 9), pre=pre)
+        n += feed_cards(db, cfg, [d], pics=pre[0])
     return n
 ASSET_KIND = {8: 'Hat', 41: 'Hair Accessory', 42: 'Face Accessory', 43: 'Neck Accessory', 44: 'Shoulder Accessory', 45: 'Front Accessory', 46: 'Back Accessory', 47: 'Waist Accessory', 61: 'Emote', 64: 'T-Shirt Accessory', 65: 'Shirt Accessory', 66: 'Pants Accessory', 67: 'Jacket Accessory', 68: 'Sweater Accessory', 69: 'Shorts Accessory', 70: 'Left Shoe Accessory', 71: 'Right Shoe Accessory', 72: 'Dress Skirt Accessory', 76: 'Eyebrow Accessory', 77: 'Eyelash Accessory', 78: 'Mood Animation', 79: 'Dynamic Head', 92: 'Avatar Background'}
 
-def feed_cards(db, cfg, items):
+def feed_cards(db, cfg, items, pics=None):
     url = cfg.get('feed_webhook_url')
     info = {e[1]['id']: e for e in ACTIVITY if e[0] == 'new'}
     ACTIVITY[:] = [e for e in ACTIVITY if e[0] != 'new']
-    pics = thumb_urls([d['id'] for d in items])
+    pics = pics if pics is not None else thumb_urls([d['id'] for d in items])
     cards = []
     for d in items:
         u = pics.get(d['id'])
