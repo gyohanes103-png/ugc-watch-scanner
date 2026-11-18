@@ -995,7 +995,7 @@ def tex_feats(im):
             out['texe'] = (e - e.mean()) / e.std()
     return out
 
-def mesh_desc(asset_id, cfg, previews=True):
+def mesh_desc(asset_id, cfg, previews=True, thumbs=True):
     try:
         data = asset_bytes(asset_id, cfg)
         ids = model_ids(data) if data else {}
@@ -1022,19 +1022,8 @@ def mesh_desc(asset_id, cfg, previews=True):
                 except Exception:
                     pass
             try:
-                want = [i for i in (ids['mesh'], ids.get('tex')) if i]
-                tu = thumb_urls(want)
-                if any((tu.get(i) == 'Pending' for i in want)):
-                    time.sleep(3)
-                    tu = thumb_urls(want)
-                u = tu.get(ids['mesh'])
-                if isinstance(u, str) and u.startswith('http'):
-                    out['render_url'] = u
-                    if previews:
-                        out['render'] = fetch_feat(u)[0]
-                u = tu.get(ids.get('tex'))
-                if isinstance(u, str) and u.startswith('http'):
-                    out['tex_url'] = u
+                if thumbs:
+                    add_previews([out], previews)
                 j = http_json(f"https://economy.roblox.com/v2/assets/{ids['mesh']}/details", tries=2) or {}
                 if j.get('Name'):
                     out['mesh_name'], out['mesh_by'] = (j['Name'], (j.get('Creator') or {}).get('Name', '?'))
@@ -1049,6 +1038,42 @@ def mesh_desc(asset_id, cfg, previews=True):
         STATS['mesh_fail'] += 1
         log('  model file unavailable:', repr(e)[:120])
     return mesh_desc_3d(asset_id, cfg)
+
+def add_previews(descs, render=True):
+    descs = [d for d in descs if d and d.get('mesh_id')]
+    want = [i for d in descs for i in (d['mesh_id'], d.get('tex_id')) if i]
+    if not want:
+        return
+    tu = thumb_urls(want)
+    late = [i for i in want if tu.get(i) == 'Pending']
+    if late:
+        time.sleep(3)
+        tu.update(thumb_urls(late))
+    for d in descs:
+        d['_pv'] = True
+        u = tu.get(d['mesh_id'])
+        if isinstance(u, str) and u.startswith('http'):
+            d['render_url'] = u
+        u = tu.get(d.get('tex_id'))
+        if isinstance(u, str) and u.startswith('http'):
+            d['tex_url'] = u
+    if render:
+        from concurrent.futures import ThreadPoolExecutor
+        todo = [d for d in descs if d.get('render_url') and d.get('render') is None]
+        with ThreadPoolExecutor(8) as ex:
+            for d, f in zip(todo, ex.map(lambda d: fetch_feat(d['render_url'])[0], todo)):
+                d['render'] = f
+MDESC = {}
+
+def prefetch_models(ids, cfg):
+    ids = [i for i in ids if i not in MDESC]
+    if not ids or not cfg.get('roblox_cookie'):
+        return
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(8) as ex:
+        got = dict(zip(ids, ex.map(lambda i: mesh_desc(i, cfg, thumbs=False), ids)))
+    add_previews(list(got.values()))
+    MDESC.update(got)
 
 def mesh_desc_3d(asset_id, cfg):
     try:
@@ -1162,10 +1187,16 @@ def decide(db, cfg, mine, cand, feat, raw_png, left, src='new'):
         if 'png' not in vm:
             vm['png'] = fetch_feat(vm['thumb'])[1] if vm['thumb'] else None
         res = apply_ai(res, ai_compare(cfg, db, vm['png'], raw_png, vm['name'], cand['name']), cfg)
-    want3d = bool(res and cfg.get('roblox_cookie') and res['visual_match'] and (res['verdict'] or res['visual'] >= cfg['ai_min_visual'] or res['name'] >= 0.6 or (res['desc'] >= 0.3) or res['credit'] or (res['ai'] and res['ai']['relation'] != 'unrelated')))
+    close = bool(res and res['visual_match'] and (res['verdict'] or res['visual'] >= cfg['ai_min_visual'] or res['name'] >= 0.6 or (res['desc'] >= 0.3) or res['credit'] or (res['ai'] and res['ai']['relation'] != 'unrelated')))
+    want3d = bool(res and cfg.get('roblox_cookie') and res['visual_match'])
     if want3d and src != 'new':
         live_poll()
-    theirs = mesh_desc(cand['id'], cfg) if want3d and time.time() < HARD['t'] else None
+    theirs = None
+    if want3d and time.time() < HARD['t']:
+        if cand['id'] in MDESC:
+            theirs = MDESC.pop(cand['id'])
+        else:
+            theirs = mesh_desc(cand['id'], cfg, thumbs=close)
     if theirs and theirs.get('mesh_id'):
         if MYM['list'] is None:
             MYM['list'] = my_models(db, cfg, mine)
@@ -1180,6 +1211,8 @@ def decide(db, cfg, mine, cand, feat, raw_png, left, src='new'):
             strength, m, d, g = max(scored, key=lambda x: x[0])
             if strength < 0.75 and vm['mesh']:
                 m, d, g = (vm, vm['mesh'], geo_compare(theirs, vm['mesh']))
+            if not theirs.get('_pv') and (g['same_mesh'] or g['same_tex'] or g['inner'] or ((g['vox'] or 0) >= 0.45) or ((g['slack'] or 0) >= 0.8)):
+                add_previews([theirs])
             if d.get('render') is None and d.get('render_url'):
                 d['render'] = fetch_feat(d['render_url'])[0]
             g['render'] = render_score(theirs, d)
@@ -1248,6 +1281,8 @@ def process(db, cfg, mine, raw, types, budget, src='new'):
     if not fresh:
         return 0
     urls, feats = get_thumbs(fresh)
+    if src != 'new' and len(fresh) > 1:
+        prefetch_models(list(fresh), cfg)
     sent = 0
     for cid, cand in fresh.items():
         if time.time() > HARD['t']:
@@ -1262,6 +1297,8 @@ def process(db, cfg, mine, raw, types, budget, src='new'):
         cand['thumb'] = u if ok else ''
         feat, raw_png = feats[u] if ok else (None, None)
         sent += decide(db, cfg, mine, cand, feat, raw_png, budget - sent, src) or 0
+    for cid in fresh:
+        MDESC.pop(cid, None)
     return sent
 
 def cycle(db, cfg):
@@ -1833,7 +1870,7 @@ def _cycle(db, cfg):
             db.commit()
             log(f'looked again at {len(ids)} items that were waiting for an AI review')
     ingest_scans(db)
-    check_deep(db, cfg, mine, types, chunk=cfg.get('deep_chunk', 25))
+    check_deep(db, cfg, mine, types, chunk=cfg.get('deep_chunk', 100))
 
 def live_poll(catch_up=False):
     if LIVE['busy'] or not LIVE.get('ctx'):
@@ -2052,7 +2089,7 @@ def live_until_end(started):
             pulled = time.time()
             if pull_scans():
                 ingest_scans(db)
-        check_deep(db, cfg, mine, types, chunk=cfg.get('deep_chunk', 25))
+        check_deep(db, cfg, mine, types, chunk=cfg.get('deep_chunk', 100))
         checkpoint_due()
         time.sleep(max(0.5, cfg.get('live_poll_seconds', 15) - (time.time() - LIVE['last'])))
     return LIVE.pop('seg')
