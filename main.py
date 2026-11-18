@@ -599,6 +599,35 @@ def cost(c):
 def fld(n, v):
     return {'name': n, 'value': str(v), 'inline': True}
 
+def family_key(name):
+    return ' '.join(tokens(name))
+
+def family(db, cand, res):
+    key, mesh = (family_key(cand['name']), ((res.get('m3d') or {}).get('theirs') or {}).get('mesh_id'))
+    if not key and (not mesh):
+        return
+    try:
+        rows = db.execute('select id, name, verdict from checked where creator=? and id<>?', (cand['creator'], cand['id'])).fetchall()
+        same = {i for i, in db.execute('select id from mesh3d where mesh_id=? and id<>?', (mesh, cand['id']))} if mesh else set()
+    except sqlite3.OperationalError:
+        return
+    kin = [(i, n, v or '') for i, n, v in rows if key and family_key(n) == key or i in same]
+    if not kin:
+        return
+    mine_t = tier(res['verdict']) if res['verdict'] else 9
+    best = min(kin, key=lambda r: tier(r[2]) if r[2] else 9)
+    best_t = tier(best[2]) if best[2] else 9
+    if best_t <= 1 and best_t < mine_t:
+        base = best[2].split(' (')[0]
+        res.update(verdict=f'{base} (same model as their flagged “{best[1][:60]}”)', colour=15158332 if best_t == 0 else 15105570, confidence=max(res['confidence'], 0.7))
+        mine_t = best_t
+    if mine_t <= 1:
+        base = res['verdict'].split(' (')[0]
+        for i, n, v in kin:
+            if (tier(v) if v else 9) > mine_t:
+                db.execute('update checked set verdict=? where id=?', (f"{base} (same model as “{cand['name'][:60]}”)", i))
+        res['family'] = [(i, n) for i, n, v in kin]
+
 def alert(cfg, cand, res):
     return send_alert(cfg, cand, res)
 
@@ -640,6 +669,9 @@ def send_alert(cfg, cand, res):
     if res['ai']:
         why.append(res['ai']['reason'][:400])
     main = {'author': {'name': 'UGC Watch'}, 'title': cand['name'][:250], 'url': link, 'color': res['colour'], 'description': f"**{label(res['verdict'])}**\n{KIND.get(cand.get('atype'), 'Accessory')} · [Roblox Page]({link})" + ('\n\n' + '\n'.join(why) if why else ''), 'fields': [fld('Creator', who(cand)), fld('Price', cost(cand)), fld('Uploaded', day(cand['created'])), fld('Looks like yours', f"{pct(res['visual']):.0%}"), fld('Takedown', level.split(':')[0])], 'footer': {'text': 'Detected'}, 'timestamp': stamp()}
+    if res.get('family'):
+        fam = res['family']
+        main['fields'].append({'name': f"Same model, {len(fam)} more listing{'s' * (len(fam) > 1)} by them", 'value': '\n'.join((f'[{n[:60]}](https://www.roblox.com/catalog/{i})' for i, n in fam[:10])) + (f'\n… and {len(fam) - 10} more' if len(fam) > 10 else ''), 'inline': False})
     mine = {'author': {'name': 'Your original'}, 'title': m['name'][:250], 'color': 2829617, 'url': f"https://www.roblox.com/catalog/{m['id']}", 'description': f"Uploaded {day(m['created'])}"}
     if cand.get('thumb'):
         main['thumbnail'] = {'url': cand['thumb']}
@@ -1178,6 +1210,8 @@ def decide(db, cfg, mine, cand, feat, raw_png, left, src='new'):
                 res.update(verdict=level[0], colour=level[1], confidence=max(res['confidence'], level[2]), match=mm)
             elif res['verdict'] and res['verdict'].startswith('Possible REMAKE') and ((vox or 0) < 0.3) and (r is not None) and (r < 0.45) and (res['visual'] < 0.45):
                 res.update(verdict='Similar look and name (3D model differs from yours)', colour=3447003)
+    if res:
+        family(db, cand, res)
     if res and res['verdict'] and res['verdict'].startswith('Listing text') and (not res['credit']) and (res['desc'] < 0.75) and (res['ai'] and res['ai']['relation'] == 'unrelated' or (res.get('render') is not None and res['render'] < 0.3)):
         res['verdict'] = None
     hit = bool(res and res['verdict'])
@@ -1812,6 +1846,10 @@ def live_poll(catch_up=False):
         db.execute('create table if not exists fed(id integer primary key, at real)')
         db.execute('create table if not exists feedwait(id integer primary key, at real)')
         db.execute('create table if not exists feedpic(id integer primary key)')
+        db.execute('create table if not exists feedfirst(id integer primary key, at real)')
+        if catch_up:
+            db.execute('insert or ignore into feedfirst select id, at from feedwait')
+            db.execute('delete from feedfirst where id not in (select id from feedwait)')
         first = not kv_get(db, 'feed_since')
         if catch_up and (not first) and (not kv_get(db, 'feedwait_v2')):
             clear_backlog(db)
@@ -1822,7 +1860,8 @@ def live_poll(catch_up=False):
         got = posted = 0
         pages = cfg.get('feed_catch_up_pages', 60) if catch_up or first else cfg.get('feed_live_pages', 10)
         url = CATALOG.replace('/v1/', '/v2/')
-        recheck = [r[0] for r in db.execute('select id from feedwait where at<? order by at limit 500', (time.time() - cfg.get('feed_recheck_seconds', 90),))]
+        now = time.time()
+        recheck = [r[0] for r in db.execute('select w.id from feedwait w left join feedfirst f on f.id=w.id where w.at < ? - max(?, ? * (? - coalesce(f.at, w.at))) order by w.at limit 500', (now, cfg.get('feed_recheck_seconds', 90), cfg.get('feed_recheck_share', 0.03), now))]
         lists = [{'IncludeNotForSale': 'true'}]
         if catch_up or first or time.time() - LIVE.get('onsale_at', 0) > cfg.get('feed_onsale_seconds', 120):
             lists.append({'salesTypeFilter': 1})
@@ -1899,6 +1938,7 @@ def feed_items(db, cfg, mine, types, items, cut, recheck=False):
         elif d.get('price') is None and d.get('lowestPrice') is None:
             if not recheck:
                 db.execute('insert or ignore into feedwait values(?,?)', (d['id'], time.time()))
+                db.execute('insert or ignore into feedfirst values(?,?)', (d['id'], time.time()))
         else:
             db.execute('delete from feedwait where id=?', (d['id'],))
             show.append(d)
@@ -1920,6 +1960,7 @@ def feed_cards(db, cfg, items):
         u = pics.get(d['id'])
         if u in ('Pending', 'InReview', None) and d['id'] not in info:
             db.execute('insert or ignore into feedwait values(?,?)', (d['id'], time.time()))
+            db.execute('insert or ignore into feedfirst values(?,?)', (d['id'], time.time()))
             db.execute('insert or ignore into feedpic values(?)', (d['id'],))
             continue
         db.execute('insert or ignore into fed values(?,?)', (d['id'], time.time()))
