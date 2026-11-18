@@ -1848,29 +1848,36 @@ def _cycle(db, cfg):
     budget = cfg['max_alerts_per_cycle']
     deadline = HARD['t']
     LIMIT.load(kv_get(db, 'rate_limits'))
-    LIVE.update(ctx=(db, cfg, mine, types), last=0, busy=False)
+    LIVE.update(ctx=(db, cfg, mine, types), last=0, busy=False, seg=time.time())
+    log('run start: catching up the feed')
     live_poll(catch_up=True)
+    log('run start: feed caught up, tuning on your items')
     if cfg.get('roblox_cookie') and (not kv_get(db, 'mymesh_full')):
         MYM['list'] = my_models(db, cfg, mine)
         if db.execute('select count(*) from mymesh').fetchone()[0] >= len(mine) - 2:
             kv_set(db, 'mymesh_full', 1)
     calibrate(db, cfg, mine)
-    if ai_ready(cfg, db):
-        ids = [r[0] for r in db.execute('select id from later limit ?', (int(os.environ.get('DEEP_PER_RUN', 10 ** 9)),))]
-        if ids:
-            q = ','.join(map(str, ids))
-            db.execute(f'delete from later where id in ({q})')
-            db.execute(f'delete from seen where id in ({q})')
-            db.commit()
-            budget -= process(db, cfg, mine, details_batch(ids), ACCESSORY, budget, 'scan')
-            for i in ids:
-                if not is_seen(db, i):
-                    db.execute('insert or ignore into later values(?)', (i,))
-                    mark(db, i)
-            db.commit()
-            log(f'looked again at {len(ids)} items that were waiting for an AI review')
+    log('run start: tuned, taking in scan results')
+    check_later(db, cfg, mine)
     ingest_scans(db)
     check_deep(db, cfg, mine, types, chunk=cfg.get('deep_chunk', 100))
+
+def check_later(db, cfg, mine, chunk=100):
+    if not ai_ready(cfg, db):
+        return
+    ids = [r[0] for r in db.execute('select id from later limit ?', (chunk,))]
+    if not ids:
+        return
+    q = ','.join(map(str, ids))
+    db.execute(f'delete from later where id in ({q})')
+    db.execute(f'delete from seen where id in ({q})')
+    db.commit()
+    process(db, cfg, mine, details_batch(ids), ACCESSORY, cfg.get('max_alerts_per_cycle', 10 ** 9), 'scan')
+    for i in ids:
+        if not is_seen(db, i):
+            db.execute('insert or ignore into later values(?)', (i,))
+            mark(db, i)
+    db.commit()
 
 def live_poll(catch_up=False):
     if LIVE['busy'] or not LIVE.get('ctx'):
@@ -2082,7 +2089,8 @@ def live_until_end(started):
         return started
     db, cfg, mine, types = LIVE['ctx']
     pulled = time.time()
-    LIVE['seg'] = started
+    LIVE['seg'] = LIVE.get('seg') or started
+    log('run start: done, watching')
     while time.time() < HARD['t'] - 120:
         live_poll()
         if time.time() - pulled > cfg.get('scan_pull_seconds', 240):
@@ -2090,6 +2098,7 @@ def live_until_end(started):
             if pull_scans():
                 ingest_scans(db)
         check_deep(db, cfg, mine, types, chunk=cfg.get('deep_chunk', 100))
+        check_later(db, cfg, mine)
         checkpoint_due()
         time.sleep(max(0.5, cfg.get('live_poll_seconds', 15) - (time.time() - LIVE['last'])))
     return LIVE.pop('seg')
