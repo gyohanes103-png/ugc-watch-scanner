@@ -1919,9 +1919,26 @@ def _cycle(db, cfg):
             kv_set(db, 'mymesh_full', 1)
     calibrate(db, cfg, mine)
     log('run start: tuned, taking in scan results')
+    if not kv_get(db, 'nopic_fix'):
+        recover_set_aside(db, 1794985700)
+        kv_set(db, 'nopic_fix', 1)
     check_later(db, cfg, mine)
     ingest_scans(db)
     check_deep(db, cfg, mine, types, chunk=cfg.get('deep_chunk', 100))
+
+def recover_set_aside(db, since):
+    try:
+        ids = [r[0] for r in db.execute('select id from seen where at>=? and id not in (select id from checked) and id not in (select id from fed) and id not in (select id from deep)', (since,))]
+    except sqlite3.OperationalError:
+        return
+    if not ids:
+        return
+    got = details_batch(ids)
+    for d in got:
+        db.execute('delete from seen where id=?', (d['id'],))
+        db.execute('insert or ignore into deep values(?,?,?)', (d['id'], 0.4, json.dumps(d)))
+    db.commit()
+    log(f'run start: {len(got)} items set aside by a busy picture service are back in the queue')
 
 def check_later(db, cfg, mine, chunk=100):
     if not ai_ready(cfg, db):
