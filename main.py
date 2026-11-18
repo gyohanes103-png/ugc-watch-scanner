@@ -1194,7 +1194,11 @@ def my_models(db, cfg, mine):
 
 def wants_ai(res, cfg):
     return bool(res and (res['verdict'] or res['visual'] >= cfg['ai_min_visual'] or res['name'] >= 0.6 or (res['desc'] >= 0.3) or res['credit']) and res['visual_match'])
-JUDGED, AICACHE = ({}, {})
+JUDGED, AICACHE, M3CLEAN = ({}, {}, set())
+
+def strong_hint(res, ai):
+    v = (res or {}).get('verdict') or ''
+    return bool(tier(v) <= 1 if v else False) or bool(ai and ai.get('relation') in ('same_model', 'remake'))
 
 def prefetch_ai(db, cfg, mine, fresh, urls, feats):
     if not ai_provider(cfg) or not ai_ready(cfg, db):
@@ -1214,10 +1218,16 @@ def prefetch_ai(db, cfg, mine, fresh, urls, feats):
         jobs.append((cid, vm['png'], raw_png, vm['name'], cand['name']))
     if not jobs:
         return
-    from concurrent.futures import ThreadPoolExecutor
+    from concurrent.futures import ThreadPoolExecutor, wait
     with ThreadPoolExecutor(int(cfg.get('ai_parallel', 8))) as ex:
-        outs = list(ex.map(lambda j: ai_compare(cfg, db, *j[1:]), jobs))
-    AICACHE.update({j[0]: o for j, o in zip(jobs, outs)})
+        futs = {ex.submit(ai_compare, cfg, db, *j[1:]): j[0] for j in jobs}
+        left = set(futs)
+        while left:
+            done, left = wait(left, timeout=10)
+            for f in done:
+                AICACHE[futs[f]] = f.result()
+            if left:
+                live_poll()
 
 def decide(db, cfg, mine, cand, feat, raw_png, left, src='new'):
     STATS['checked'] += 1
@@ -1241,7 +1251,7 @@ def decide(db, cfg, mine, cand, feat, raw_png, left, src='new'):
             ai = ai_compare(cfg, db, vm['png'], raw_png, vm['name'], cand['name'])
         res = apply_ai(res, ai, cfg)
     close = bool(res and res['visual_match'] and (res['verdict'] or res['visual'] >= cfg['ai_min_visual'] or res['name'] >= 0.6 or (res['desc'] >= 0.3) or res['credit'] or (res['ai'] and res['ai']['relation'] != 'unrelated')))
-    want3d = bool(res and cfg.get('roblox_cookie') and res['visual_match'])
+    want3d = bool(res and cfg.get('roblox_cookie') and res['visual_match'] and (cand['id'] not in M3CLEAN or strong_hint(res, res.get('ai'))))
     if want3d and src != 'new':
         live_poll()
     theirs = None
@@ -1339,9 +1349,18 @@ def process(db, cfg, mine, raw, types, budget, src='new', pre=None):
     if not fresh:
         return 0
     urls, feats = pre if pre and all((i in pre[0] for i in fresh)) else get_thumbs(fresh)
+    if src != 'new':
+        try:
+            q = ','.join(map(str, fresh))
+            done = {r[0] for r in db.execute(f'select id from m3seen where id in ({q})')}
+        except sqlite3.OperationalError:
+            done = set()
+        hit = {d['id'] for d in raw if d.get('_m3')}
+        M3CLEAN.update(done - hit)
     if src != 'new' and len(fresh) > 1:
-        prefetch_models(list(fresh), cfg)
         prefetch_ai(db, cfg, mine, fresh, urls, feats)
+        need = [c for c in fresh if c not in M3CLEAN or strong_hint(JUDGED.get(c), AICACHE.get(c))]
+        prefetch_models(need, cfg)
     sent = 0
     for cid, cand in fresh.items():
         if time.time() > HARD['t']:
@@ -1360,6 +1379,7 @@ def process(db, cfg, mine, raw, types, budget, src='new', pre=None):
         MDESC.pop(cid, None)
         JUDGED.pop(cid, None)
         AICACHE.pop(cid, None)
+        M3CLEAN.discard(cid)
     return sent
 
 def cycle(db, cfg):
@@ -1924,7 +1944,7 @@ def _cycle(db, cfg):
         kv_set(db, 'nopic_fix', 1)
     check_later(db, cfg, mine)
     ingest_scans(db)
-    check_deep(db, cfg, mine, types, chunk=cfg.get('deep_chunk', 100))
+    check_deep(db, cfg, mine, types, chunk=cfg.get('deep_chunk', 200))
 
 def recover_set_aside(db, since):
     try:
@@ -2201,7 +2221,7 @@ def live_until_end(started):
             pulled = time.time()
             if pull_scans():
                 ingest_scans(db)
-        check_deep(db, cfg, mine, types, chunk=cfg.get('deep_chunk', 100))
+        check_deep(db, cfg, mine, types, chunk=cfg.get('deep_chunk', 200))
         check_later(db, cfg, mine)
         checkpoint_due()
         time.sleep(max(0.5, cfg.get('live_poll_seconds', 15) - (time.time() - LIVE['last'])))
@@ -2219,7 +2239,21 @@ def checkpoint(db, cfg, mine, seg):
         STATS[k] = '' if k == 'note' else 0
     PENDING.clear()
     TIERS.clear()
+    if code_changed():
+        log('newer version published: handing over to the next run')
+        HARD['t'] = min(HARD['t'], time.time() + 150)
     return time.time()
+
+def code_changed():
+    repo = os.environ.get('GITHUB_REPOSITORY')
+    if not repo:
+        return False
+    try:
+        r = requests.get(f'https://raw.githubusercontent.com/{repo}/main/{pathlib.Path(sys.argv[0]).name}', timeout=20)
+        mine = pathlib.Path(sys.argv[0]).read_bytes()
+        return r.status_code == 200 and len(r.content) > 1000 and (hashlib.sha256(r.content).digest() != hashlib.sha256(mine).digest())
+    except Exception:
+        return False
 
 def save_data():
     import subprocess
