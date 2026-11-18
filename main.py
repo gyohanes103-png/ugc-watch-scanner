@@ -1254,6 +1254,7 @@ def process(db, cfg, mine, raw, types, budget, src='new'):
             break
         if src != 'new':
             live_poll()
+        checkpoint_due()
         u = urls.get(cid)
         if u in ('Pending', 'InReview', None):
             continue
