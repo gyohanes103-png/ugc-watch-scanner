@@ -1980,9 +1980,10 @@ def live_poll(catch_up=False):
                 db.commit()
         if recheck and (not first):
             db.executemany('update feedwait set at=? where id=?', [(time.time(), i) for i in recheck])
-            items = details_batch(recheck)
-            for i in set(recheck) - {d['id'] for d in items}:
+            sale, gone = on_sale_now(recheck)
+            for i in gone:
                 db.execute('delete from feedwait where id=?', (i,))
+            items = details_batch(sale) if sale else []
             posted += feed_items(db, cfg, mine, types, items, cut, recheck=True)
         flush_feed(cfg)
         db.commit()
@@ -2025,6 +2026,18 @@ def clear_backlog(db):
             db.execute('insert or ignore into deep values(?,?,?)', (d['id'], 0, json.dumps(d)))
     db.commit()
     log(f"feed: cleared {len(late)} late listings into the copy check, {db.execute('select count(*) from feedwait').fetchone()[0]} still waiting")
+
+def on_sale_now(ids):
+    from concurrent.futures import ThreadPoolExecutor
+
+    def one(i):
+        j = http_json(f'https://economy.roblox.com/v2/assets/{i}/details', tries=2, max_wait=10)
+        if j is None:
+            return (i, None)
+        return (i, bool(j.get('IsForSale')))
+    with ThreadPoolExecutor(8) as ex:
+        res = list(ex.map(one, ids))
+    return ([i for i, v in res if v], [])
 
 def feed_items(db, cfg, mine, types, items, cut, recheck=False):
     show = []
@@ -2118,7 +2131,12 @@ def check_deep(db, cfg, mine, types, chunk=None):
     process(db, cfg, mine, [json.loads(r[1]) for r in rows], ACCESSORY | types, cfg.get('max_alerts_per_cycle', 10 ** 9), 'scan')
     back = [r for r in rows if not is_seen(db, r[0])]
     for i, raw in back:
-        db.execute('insert or ignore into deep values(?,?,?)', (i, json.loads(raw).get('_score', 0), raw))
+        d = json.loads(raw)
+        d['_tries'] = d.get('_tries', 0) + 1
+        if d['_tries'] >= cfg.get('deep_tries', 4):
+            mark(db, i)
+            continue
+        db.execute('insert or ignore into deep values(?,?,?)', (i, d.get('_score', 0) - 10 * d['_tries'], json.dumps(d)))
     db.commit()
     if not chunk:
         log(f"catalog scanner: checked {len(rows) - len(back)} look-alikes, {db.execute('select count(*) from deep').fetchone()[0]} still queued")
