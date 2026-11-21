@@ -541,8 +541,10 @@ def apply_ai(res, ai, cfg):
         res.update(verdict='Possible REMAKE of your model (AI agrees)', colour=15105570, confidence=max(min(res['confidence'], 0.9), 0.4 + 0.4 * c), match=res['visual_match'] or res['match'])
     elif strong_text and cfg['text_alerts']:
         res.update(verdict='Listing text copied (AI: model is different)', colour=15844367, confidence=min(res['confidence'], 0.6))
-    elif res['visual'] >= cfg['copy_threshold'] and c < 0.8:
-        pass
+    elif res['visual'] >= cfg['copy_threshold']:
+        # HARD VISUAL OVERRIDE: If the picture match is extremely high, the AI is being overly cautious.
+        # Keep the COPY verdict, ignore the AI's attempt to downgrade it.
+        res.update(verdict='Likely COPY / recolour of your model (picture match)', colour=15158332)
     elif rel == 'similar_style' and res['verdict']:
         res.update(verdict='Similar look and name (AI: same style, different model)', colour=3447003, confidence=min(res['confidence'], 0.5))
     else:
@@ -636,6 +638,14 @@ def family(db, cand, res):
     kin = [(i, n, v or '') for i, n, v in rows if key and family_key(n) == key or i in same]
     if not kin:
         return
+    
+    # Do not group based on name alone if the current item is a weak match.
+    # Require visual >= 0.40 or shape >= 0.45 for name-based grouping.
+    vis = res.get('visual', 0)
+    shape = (res.get('m3d') or {}).get('score') or 0.0
+    if key and not (vis >= 0.40 or shape >= 0.45):
+        return
+
     mine_t = tier(res['verdict']) if res['verdict'] else 9
     best = min(kin, key=lambda r: tier(r[2]) if r[2] else 9)
     best_t = tier(best[2]) if best[2] else 9
@@ -692,8 +702,11 @@ def send_alert(cfg, cand, res):
         why.append(res['ai']['reason'][:400])
     main = {'author': {'name': 'UGC Watch'}, 'title': cand['name'][:250], 'url': link, 'color': res['colour'], 'description': f"**{label(res['verdict'])}**\n{KIND.get(cand.get('atype'), 'Accessory')} · [Roblox Page]({link})" + ('\n\n' + '\n'.join(why) if why else ''), 'fields': [fld('Creator', who(cand)), fld('Price', cost(cand)), fld('Uploaded', day(cand['created'])), fld('Looks like yours', f"{pct(res['visual']):.0%}"), fld('Takedown', level.split(':')[0])], 'footer': {'text': 'Detected'}, 'timestamp': stamp()}
     if res.get('family'):
-        fam = res['family']
-        main['fields'].append({'name': f"Same model, {len(fam)} more listing{'s' * (len(fam) > 1)} by them", 'value': '\n'.join((f'[{n[:60]}](https://www.roblox.com/catalog/{i})' for i, n in fam[:10])) + (f'\n… and {len(fam) - 10} more' if len(fam) > 10 else ''), 'inline': False})
+        # Only show the family list if the visual or 3D match is actually decent. 
+        # This prevents spamming 33 links if the bot grouped them purely by a generic name match.
+        if res.get("visual", 0) > 0.10 or (res.get("m3d") or {}).get("score", 0) > 0.50:
+            fam = res['family']
+            main['fields'].append({'name': f"Same model, {len(fam)} more listing{'s' * (len(fam) > 1)} by them", 'value': '\n'.join((f'[{n[:60]}](https://www.roblox.com/catalog/{i})' for i, n in fam[:10])) + (f'\n… and {len(fam) - 10} more' if len(fam) > 10 else ''), 'inline': False})
     mine = {'author': {'name': 'Your original'}, 'title': m['name'][:250], 'color': 2829617, 'url': f"https://www.roblox.com/catalog/{m['id']}", 'description': f"Uploaded {day(m['created'])}"}
     if cand.get('thumb'):
         main['thumbnail'] = {'url': cand['thumb']}
@@ -1315,6 +1328,32 @@ def decide(db, cfg, mine, cand, feat, raw_png, left, src='new'):
         family(db, cand, res)
     if res and res['verdict'] and res['verdict'].startswith('Listing text') and (not res['credit']) and (res['desc'] < 0.75) and (res['ai'] and res['ai']['relation'] == 'unrelated' or (res.get('render') is not None and res['render'] < 0.3)):
         res['verdict'] = None
+
+    # === 3D GEOMETRY AUTHORITY (Research-Backed) ===
+    if res and res.get("verdict"):
+        shape = (res.get("m3d") or {}).get("score") or 0.0
+        vis = res.get("visual", 0.0)
+        ai_rel = res["ai"]["relation"] if res.get("ai") else ""
+        
+        # 1. HARD KILL: If the 3D shape is under 30% and the picture is under 10%, it is NOT a copy.
+        # (Kills the Red Crown at 6% and Emissive Horns at 10%, regardless of what AI says)
+        if shape < 0.30 and vis < 0.10:
+            res["verdict"] = None
+            res["confidence"] = 0.0
+            
+        # 2. HARD ALERT: If the 3D shape is 40% or higher, it IS a stolen mesh. 
+        # (Keeps the Cat Tail at 49%, even if the picture is 11%)
+        elif shape >= 0.40:
+            if "REMAKE" in res["verdict"] or "Similar" in res["verdict"] or "COPY" in res["verdict"]:
+                res["verdict"] = "Possible REMAKE (3D geometry matches)"
+                res["colour"] = 15105570
+                
+        # 3. AI OVERRIDE (Mid-ground): If AI strongly says it's a copy, but shape is 20-40%
+        elif ai_rel in ("same_model", "remake") and shape >= 0.20:
+            res["verdict"] = "Possible REMAKE (AI confirms geometry)"
+            res["colour"] = 15105570
+    # ===============================================
+
     hit = bool(res and res['verdict'])
     if hit and cand.get('cid') in cfg.get('low_priority_creator_ids', []) and (tier(res['verdict']) > 0):
         hit = False
