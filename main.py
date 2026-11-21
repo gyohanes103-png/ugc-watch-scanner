@@ -1335,14 +1335,17 @@ def decide(db, cfg, mine, cand, feat, raw_png, left, src='new'):
             
         # 2. HARD ALERT: If the 3D shape is 40% or higher, it IS a stolen mesh. 
         # (Keeps the Cat Tail at 49%, even if the picture is 11% and AI was skipped)
+        # CRITICAL FIX: Do not downgrade a perfect 3D copy to a Remake!
         elif shape >= 0.40:
-            res["verdict"] = "Possible REMAKE (3D geometry matches)"
-            res["colour"] = 15105570
+            if not res.get("verdict") or "COPY" not in res["verdict"]:
+                res["verdict"] = "Possible REMAKE (3D geometry matches)"
+                res["colour"] = 15105570
                 
         # 3. AI OVERRIDE (Mid-ground): If AI strongly says it's a copy, but shape is 20-40%
         elif ai_rel in ("same_model", "remake") and shape >= 0.20:
-            res["verdict"] = "Possible REMAKE (AI confirms geometry)"
-            res["colour"] = 15105570
+            if not res.get("verdict") or "COPY" not in res["verdict"]:
+                res["verdict"] = "Possible REMAKE (AI confirms geometry)"
+                res["colour"] = 15105570
     # ===============================================
 
     hit = bool(res and res['verdict'])
