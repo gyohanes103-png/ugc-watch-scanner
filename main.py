@@ -3,6 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import requests
 from PIL import Image, ImageFilter, ImageOps
+
 HERE = pathlib.Path(__file__).resolve().parent
 CATALOG = 'https://catalog.roblox.com/v1/search/items/details'
 THUMBS = 'https://thumbnails.roblox.com/v1/assets'
@@ -10,6 +11,7 @@ SUBCAT = {46: 25, 47: 26}
 COLOURS = set('black white grey gray red blue pink purple violet green yellow orange brown\nlight dark pastel neon gold golden silver cyan teal lavender beige cream blonde ginger\nombre rainbow and'.split())
 STOP = set('the a an of for with to in on my your our is it its this that very'.split())
 DEFAULTS = {'discord_webhook_url': '', 'my_creator_id': 0, 'my_creator_type': 'Group', 'ignore_creator_ids': [], 'extra_asset_types': [], 'poll_minutes': 5, 'feed_pages': 6, 'sweep_hours': 12, 'sweep_pages': 15, 'refresh_my_items_hours': 6, 'copy_threshold': 0.8, 'remake_threshold': 0.63, 'combo_threshold': 0.5, 'ai_provider': 'auto', 'anthropic_api_key': '', 'gemini_api_key': '', 'anthropic_workspace_id': '', 'anthropic_model': 'claude-haiku-5-5', 'gemini_model': 'gemini-3.5-flash', 'ai_min_visual': 0.42, 'scan_min_visual': 0.42, 'ai_max_calls_per_day': 10 ** 9, 'text_alerts': True, 'max_alerts_per_cycle': 10 ** 9, 'status_updates': 'every_run', 'max_run_minutes': 12}
+
 sess = requests.Session()
 sess.headers['User-Agent'] = 'Mozilla/5.0 (ugc-watch; personal IP monitoring)'
 AI_DOWN = set()
@@ -28,13 +30,10 @@ def log(*a):
 
 class Limiter:
     import threading as _th
-
     def __init__(self):
         self.st, self.lock = ({}, self._th.Lock())
-
     def _s(self, host):
         return self.st.setdefault(host, {'budget': 60.0, 'cool': 5.0, 'lo': 0.0, 'hi': 0.0, 'times': [], 'oks': [], 'until': 0.0, 'streak': 0.0, 'waited': 0.0, 'quiet': time.time(), 'busy': 0})
-
     def before(self, host, max_block=float('inf')):
         with self.lock:
             st, now = (self._s(host), time.time())
@@ -50,7 +49,6 @@ class Limiter:
         with self.lock:
             self._s(host)['times'].append(time.time())
         return True
-
     def busy(self, host, retry_after=None):
         with self.lock:
             st, now = (self._s(host), time.time())
@@ -79,7 +77,6 @@ class Limiter:
             start = st['streak'] or now
             st['waited'], st['until'] = (wait, start + wait)
             st['streak'], st['quiet'] = (start, now)
-
     def ok(self, host):
         with self.lock:
             st = self._s(host)
@@ -90,15 +87,14 @@ class Limiter:
                 st['lo'] = min(st['lo'], st['hi'])
                 st['cool'] = st['hi']
                 st['streak'] = 0.0
-
     def export(self):
         return {h: {'budget': round(v['budget'], 1), 'cool': round(v['cool'], 2), 'busy': v['busy']} for h, v in self.st.items()}
-
     def load(self, saved):
         for h, v in (saved or {}).items():
             st = self._s(h)
             st['budget'], st['cool'] = (float(v.get('budget', 60)), float(v.get('cool', 5)))
             st['hi'] = st['cool'] if v.get('busy') else 0.0
+
 LIMIT = Limiter()
 
 def _host(url):
@@ -129,6 +125,7 @@ def http_json(url, params=None, tries=6, max_wait=90, signed_in=False):
         log(f'  HTTP {r.status_code} from {url}: {r.text[:120]}')
         return None
     return None
+
 N = 64
 
 def _mask_rgb(im):
@@ -415,6 +412,7 @@ def judge(cand, feat, mine, cfg):
     text = 0.3 * ns + 0.4 * max(ds, 1.0 if stolen_credit else 0.0)
     conf = min(0.99, v + (1 - v) * text) if v >= cfg['combo_threshold'] else min(0.6, 0.25 + 0.35 * ds + (0.2 if stolen_credit else 0))
     return {'verdict': verdict, 'colour': colour, 'confidence': conf, 'visual': v, 'shape': vis[1], 'detail': vis[2], 'mirrored': vis[3], 'name': ns, 'desc': ds, 'credit': stolen_credit, 'ai': None, 'visual_match': vm, 'match': vm if vm and v >= cfg['combo_threshold'] else dm if ds >= 0.25 or stolen_credit else vm or nm}
+
 AI_PROMPT = 'You are checking whether a newly published Roblox accessory copies an existing one.\nImage 1 is the ORIGINAL ("{mine}"). Image 2 is the NEW item ("{theirs}").\nBoth are catalog thumbnails rendered from the same fixed camera. Ignore colour and texture colour.\nLook at silhouette, pose/curl, proportions, and the shape, size and placement of individual\ndetails (tufts, spikes, folds, parts).\nAnswer with JSON only:\n{{"relation": "same_model" | "remake" | "similar_style" | "unrelated",\n  "confidence": 0-100, "reason": "one short sentence naming the deciding details"}}\nsame_model = the same 3D mesh, possibly recoloured, retextured, mirrored or rescaled.\nremake = a different mesh clearly modelled after the original (same pose and distinctive details).\nsimilar_style = same kind of item or trend, but independently made.\nunrelated = different kind of item.'
 
 def _ai_png(img_bytes):
@@ -453,6 +451,7 @@ def ai_ready(cfg, db):
         STATS['note'] = 'daily AI budget reached, the rest waits for tomorrow'
         return False
     return True
+
 SEVERITY = ['unrelated', 'similar_style', 'remake', 'same_model']
 
 def ai_compare(cfg, db, mine_png, theirs_png, mine_name, theirs_name):
@@ -461,12 +460,7 @@ def ai_compare(cfg, db, mine_png, theirs_png, mine_name, theirs_name):
         if o:
             return o
     return None
-    got = []
-    if len(got) < 2:
-        return got[0] if got else None
-    a, b = sorted(got, key=lambda o: SEVERITY.index(o['relation']))
-    agree = a['relation'] == b['relation']
-    return {'relation': a['relation'], 'confidence': max(a['confidence'], b['confidence']) if agree else min(a['confidence'], b['confidence']), 'reason': ' | '.join((f"{o['provider']}: {o['relation'].replace('_', ' ')}, {o['reason']}" for o in got))[:600], 'provider': 'both agree' if agree else 'they disagree'}
+
 import threading
 AILOCK = threading.RLock()
 
@@ -542,8 +536,6 @@ def apply_ai(res, ai, cfg):
     elif strong_text and cfg['text_alerts']:
         res.update(verdict='Listing text copied (AI: model is different)', colour=15844367, confidence=min(res['confidence'], 0.6))
     elif res['visual'] >= cfg['copy_threshold']:
-        # HARD VISUAL OVERRIDE: If the picture match is extremely high, the AI is being overly cautious.
-        # Keep the COPY verdict, ignore the AI's attempt to downgrade it.
         res.update(verdict='Likely COPY / recolour of your model (picture match)', colour=15158332)
     elif rel == 'similar_style' and res['verdict']:
         res.update(verdict='Similar look and name (AI: same style, different model)', colour=3447003, confidence=min(res['confidence'], 0.5))
@@ -603,11 +595,13 @@ def takedown(cand, res, m):
         t.append('Their listing description also reuses text from my listing' + (', including my modeller credit ' + ', '.join(res['credit']) if res['credit'] else '') + '.')
     t.append('I am the rights holder of the original item and did not authorise this use.')
     return (level, '\n'.join(t))
+
 PENDING, TIERS = ({}, {})
 RANK = [('Likely COPY', 'copy'), ('Possible REMAKE', 'remake'), ('Listing text', 'text'), ('Similar look', 'similar')]
 
 def tier(v):
     return next((k for k, (p, _) in enumerate(RANK) if v.startswith(p)), 9)
+
 KIND = {8: 'Hat', 41: 'Hair Accessory', 42: 'Face Accessory', 43: 'Neck Accessory', 44: 'Shoulder Accessory', 45: 'Front Accessory', 46: 'Back Accessory', 47: 'Waist Accessory'}
 ACCESSORY = {8, 41, 42, 43, 44, 45, 46, 47}
 
@@ -639,8 +633,6 @@ def family(db, cand, res):
     if not kin:
         return
     
-    # Do not group based on name alone if the current item is a weak match.
-    # Require visual >= 0.40 or shape >= 0.45 for name-based grouping.
     vis = res.get('visual', 0)
     shape = (res.get('m3d') or {}).get('score') or 0.0
     if key and not (vis >= 0.40 or shape >= 0.45):
@@ -665,6 +657,7 @@ def alert(cfg, cand, res):
 
 def flush_alerts(cfg):
     pass
+
 TIER_NAMES = {'strong': 'strong takedown case', 'possible': 'possible takedown case', 'remake': 'possible remake', 'text': 'copied listing text', 'similar': 'similar look and name', 'copy': 'likely copy'}
 
 def send_alert(cfg, cand, res):
@@ -702,8 +695,6 @@ def send_alert(cfg, cand, res):
         why.append(res['ai']['reason'][:400])
     main = {'author': {'name': 'UGC Watch'}, 'title': cand['name'][:250], 'url': link, 'color': res['colour'], 'description': f"**{label(res['verdict'])}**\n{KIND.get(cand.get('atype'), 'Accessory')} · [Roblox Page]({link})" + ('\n\n' + '\n'.join(why) if why else ''), 'fields': [fld('Creator', who(cand)), fld('Price', cost(cand)), fld('Uploaded', day(cand['created'])), fld('Looks like yours', f"{pct(res['visual']):.0%}"), fld('Takedown', level.split(':')[0])], 'footer': {'text': 'Detected'}, 'timestamp': stamp()}
     if res.get('family'):
-        # Only show the family list if the visual or 3D match is actually decent. 
-        # This prevents spamming 33 links if the bot grouped them purely by a generic name match.
         if res.get("visual", 0) > 0.10 or (res.get("m3d") or {}).get("score", 0) > 0.50:
             fam = res['family']
             main['fields'].append({'name': f"Same model, {len(fam)} more listing{'s' * (len(fam) > 1)} by them", 'value': '\n'.join((f'[{n[:60]}](https://www.roblox.com/catalog/{i})' for i, n in fam[:10])) + (f'\n… and {len(fam) - 10} more' if len(fam) > 10 else ''), 'inline': False})
@@ -958,6 +949,7 @@ def vox_score(a, b):
                 strict = max(strict, (ga & g).sum() / max(1, (ga | g).sum()))
                 slack = max(slack, min((ga & _thick(g)).sum() / na, (g & da).sum() / max(1, g.sum())))
     return (float(strict), float(slack))
+
 STD_NAMES = {'handle', 'mesh', 'thumbnailconfiguration', 'thumbnailcameratarget', 'thumbnailcameravalue', 'avatarpartscaletype', 'originalsize', 'surfaceappearance', 'wraplayer', 'accessory', 'specialmesh', 'meshpart', 'weld', 'accessoryweld', 'rigidconstraint'}
 
 def _strings(body):
@@ -1330,7 +1322,7 @@ def decide(db, cfg, mine, cand, feat, raw_png, left, src='new'):
         res['verdict'] = None
 
     # === 3D GEOMETRY AUTHORITY (Research-Backed) ===
-    if res and res.get("verdict"):
+    if res:
         shape = (res.get("m3d") or {}).get("score") or 0.0
         vis = res.get("visual", 0.0)
         ai_rel = res["ai"]["relation"] if res.get("ai") else ""
@@ -1342,11 +1334,10 @@ def decide(db, cfg, mine, cand, feat, raw_png, left, src='new'):
             res["confidence"] = 0.0
             
         # 2. HARD ALERT: If the 3D shape is 40% or higher, it IS a stolen mesh. 
-        # (Keeps the Cat Tail at 49%, even if the picture is 11%)
+        # (Keeps the Cat Tail at 49%, even if the picture is 11% and AI was skipped)
         elif shape >= 0.40:
-            if "REMAKE" in res["verdict"] or "Similar" in res["verdict"] or "COPY" in res["verdict"]:
-                res["verdict"] = "Possible REMAKE (3D geometry matches)"
-                res["colour"] = 15105570
+            res["verdict"] = "Possible REMAKE (3D geometry matches)"
+            res["colour"] = 15105570
                 
         # 3. AI OVERRIDE (Mid-ground): If AI strongly says it's a copy, but shape is 20-40%
         elif ai_rel in ("same_model", "remake") and shape >= 0.20:
@@ -1491,13 +1482,10 @@ def post_activity(cfg):
     ACTIVITY.clear()
 
 def write_report(db):
-
     def rows(where, order, n):
         return db.execute(f'select id,name,creator,created,visual,mine_id,mine_name,verdict,ai from checked {where} order by {order} limit {n}').fetchall()
-
     def esc(s):
         return str(s).replace('|', '/').replace('\n', ' ')[:60]
-
     def table(rs, result=True):
         out = ['| Their item | Uploaded by | Uploaded | Closest item of yours | Looks alike |' + (' Result |' if result else ''), '|---|---|---|---|---|' + ('---|' if result else '')]
         for r in rs:
